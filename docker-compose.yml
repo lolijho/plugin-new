@@ -1,0 +1,46 @@
+# Coolify-ready stack: Next.js app + Postgres 18 with pgvector.
+# In Coolify you can paste this as a "Docker Compose" resource. Coolify creates
+# a shared network automatically, so services reach each other by name (db).
+services:
+  db:
+    image: pgvector/pgvector:pg18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wpforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wpforge}
+      POSTGRES_DB: ${POSTGRES_DB:-wpforge}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wpforge} -d ${POSTGRES_DB:-wpforge}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wpforge}:${POSTGRES_PASSWORD:-wpforge}@db:5432/${POSTGRES_DB:-wpforge}
+      AUTH_SECRET: ${AUTH_SECRET:?set a long random AUTH_SECRET}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set your OpenRouter API key}
+      OPENROUTER_SITE_URL: ${OPENROUTER_SITE_URL:-}
+      OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-WP Plugin Forge}
+      DEFAULT_ARCHITECT_MODEL: ${DEFAULT_ARCHITECT_MODEL:-anthropic/claude-opus-4.1}
+      DEFAULT_CODER_MODEL: ${DEFAULT_CODER_MODEL:-anthropic/claude-sonnet-4.5}
+      DEFAULT_REVIEWER_MODEL: ${DEFAULT_REVIEWER_MODEL:-anthropic/claude-opus-4.1}
+      EMBEDDINGS_API_KEY: ${EMBEDDINGS_API_KEY:-}
+      EMBEDDINGS_BASE_URL: ${EMBEDDINGS_BASE_URL:-https://api.openai.com/v1}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-text-embedding-3-small}
+      EMBEDDINGS_DIMENSIONS: ${EMBEDDINGS_DIMENSIONS:-1536}
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+
+volumes:
+  db-data:

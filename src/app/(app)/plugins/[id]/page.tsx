@@ -1,0 +1,408 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
+import type { PluginManifest } from "@/lib/types";
+import StatusBadge from "@/components/StatusBadge";
+import SeverityBadge from "@/components/SeverityBadge";
+import ManifestEditor from "./ManifestEditor";
+
+type FileRow = {
+  id: string;
+  path: string;
+  language: string;
+  content: string;
+  purpose: string;
+  worstSeverity: string | null;
+};
+type Finding = {
+  id: string;
+  filePath: string;
+  severity: string;
+  category: string;
+  line: number | null;
+  message: string;
+  suggestion: string | null;
+  source: string;
+};
+type Message = {
+  id: string;
+  role: string;
+  phase: string | null;
+  content: string;
+  model: string | null;
+  createdAt: string;
+};
+type PluginRow = {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+  status: string;
+  brief: string;
+  manifest: PluginManifest | null;
+  version: number;
+};
+
+type Tab = "architecture" | "files" | "issues" | "log";
+
+export default function PluginWorkspace() {
+  const { id } = useParams<{ id: string }>();
+  const search = useSearchParams();
+  const router = useRouter();
+
+  const [plugin, setPlugin] = useState<PluginRow | null>(null);
+  const [files, setFiles] = useState<FileRow[]>([]);
+  const [findings, setFindings] = useState<Finding[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [manifest, setManifest] = useState<PluginManifest | null>(null);
+  const [brief, setBrief] = useState("");
+  const [revisionNote, setRevisionNote] = useState("");
+  const [tab, setTab] = useState<Tab>("architecture");
+  const [selected, setSelected] = useState<string | null>(null);
+
+  const [busy, setBusy] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [progress, setProgress] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const started = useRef(false);
+
+  const load = useCallback(async () => {
+    const res = await fetch(`/api/plugins/${id}`);
+    if (!res.ok) {
+      setError("Could not load plugin.");
+      return;
+    }
+    const data = await res.json();
+    setPlugin(data.plugin);
+    setFiles(data.files ?? []);
+    setFindings(data.findings ?? []);
+    setMessages(data.messages ?? []);
+    setBrief((b) => b || data.plugin.brief || "");
+    if (data.plugin.manifest) setManifest((m) => m ?? data.plugin.manifest);
+    if ((data.files?.length ?? 0) > 0) setTab((t) => (t === "architecture" ? "files" : t));
+    return data.plugin as PluginRow;
+  }, [id]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const runArchitect = useCallback(
+    async (opts: { brief?: string; revisionNote?: string }) => {
+      setBusy(true);
+      setError(null);
+      try {
+        const res = await fetch(`/api/plugins/${id}/architect`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(opts),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "Architect failed");
+        setManifest(data.manifest);
+        setRevisionNote("");
+        setTab("architecture");
+        await load();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Architect failed");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [id, load],
+  );
+
+  // Auto-start architecture for freshly created plugins (?start=1).
+  useEffect(() => {
+    if (started.current) return;
+    if (search.get("start") === "1" && plugin?.status === "draft") {
+      started.current = true;
+      runArchitect({ brief: plugin.brief });
+    }
+  }, [search, plugin, runArchitect]);
+
+  async function saveManifest(silent = false) {
+    if (!manifest) return;
+    const res = await fetch(`/api/plugins/${id}/manifest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manifest }),
+    });
+    if (!res.ok && !silent) {
+      const d = await res.json();
+      setError(d.error ?? "Could not save manifest");
+    }
+  }
+
+  async function generate() {
+    setError(null);
+    await saveManifest(true);
+    setGenerating(true);
+    setProgress([]);
+    setTab("log");
+    try {
+      const res = await fetch(`/api/plugins/${id}/generate`, { method: "POST" });
+      if (!res.body) throw new Error("No stream");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part.split("\n").find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          try {
+            handleEvent(JSON.parse(line.slice(5).trim()));
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } catch (err) {
+      setProgress((p) => [...p, `⚠️ ${err instanceof Error ? err.message : "stream error"}`]);
+    } finally {
+      setGenerating(false);
+      await load();
+    }
+  }
+
+  function handleEvent(e: Record<string, unknown>) {
+    const t = e.type as string;
+    const push = (s: string) => setProgress((p) => [...p, s]);
+    if (t === "file:start") push(`📝 [${e.index}/${e.total}] Coding ${e.path}…`);
+    else if (t === "file:coded") push(`   ✓ written ${e.path}`);
+    else if (t === "file:reviewed") push(`   🔍 reviewed ${e.path} — ${e.findings} finding(s)${e.worst ? `, worst: ${e.worst}` : ""}`);
+    else if (t === "file:fixed") push(`   🛠️ autofix pass ${e.iteration} on ${e.path}`);
+    else if (t === "file:done") push(`   ✅ done ${e.path}`);
+    else if (t === "log") push(`ℹ️ ${e.message}`);
+    else if (t === "phase") push(`— ${e.message}`);
+    else if (t === "done") push(`🏁 Finished: ${e.status} (${e.critical} critical, ${e.high} high)`);
+    else if (t === "error") push(`❌ ${e.message}`);
+  }
+
+  async function remove() {
+    if (!confirm("Delete this plugin and all its files?")) return;
+    await fetch(`/api/plugins/${id}`, { method: "DELETE" });
+    router.push("/");
+  }
+
+  if (error && !plugin) return <div className="card p-6 text-red-300">{error}</div>;
+  if (!plugin) return <div className="text-sm text-[var(--color-muted)]">Loading…</div>;
+
+  const hasFiles = files.length > 0;
+  const critical = findings.filter((f) => f.severity === "critical").length;
+  const high = findings.filter((f) => f.severity === "high").length;
+  const selectedFile = files.find((f) => f.path === selected) ?? files[0] ?? null;
+
+  return (
+    <div className="space-y-5">
+      {/* Header */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-3">
+            <h1 className="text-xl font-semibold">{plugin.name}</h1>
+            <StatusBadge status={plugin.status} />
+          </div>
+          <p className="mt-0.5 font-mono text-xs text-[var(--color-muted)]">
+            {plugin.slug} · v{plugin.version}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {hasFiles && (
+            <a className="btn-ghost" href={`/api/plugins/${id}/zip`}>
+              ⬇ Download ZIP
+            </a>
+          )}
+          <button className="btn-danger" onClick={remove}>Delete</button>
+        </div>
+      </div>
+
+      {error && <div className="rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">{error}</div>}
+
+      {/* Tabs */}
+      <div className="flex gap-1 border-b border-[var(--color-border)]">
+        {(["architecture", "files", "issues", "log"] as Tab[]).map((tb) => (
+          <button
+            key={tb}
+            onClick={() => setTab(tb)}
+            className={`-mb-px border-b-2 px-4 py-2 text-sm capitalize transition-colors ${
+              tab === tb
+                ? "border-[var(--color-accent)] text-[var(--color-text)]"
+                : "border-transparent text-[var(--color-muted)] hover:text-[var(--color-text)]"
+            }`}
+          >
+            {tb}
+            {tb === "issues" && findings.length > 0 && (
+              <span className="ml-1.5 rounded bg-[var(--color-panel-2)] px-1.5 text-xs">{findings.length}</span>
+            )}
+            {tb === "files" && hasFiles && (
+              <span className="ml-1.5 rounded bg-[var(--color-panel-2)] px-1.5 text-xs">{files.length}</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* ARCHITECTURE TAB */}
+      {tab === "architecture" && (
+        <div className="space-y-4">
+          {!manifest ? (
+            <div className="card space-y-3 p-4">
+              <label className="label">Plugin brief</label>
+              <textarea
+                className="input min-h-[160px]"
+                value={brief}
+                onChange={(e) => setBrief(e.target.value)}
+                placeholder="Describe what the plugin should do…"
+              />
+              <button className="btn-primary" disabled={busy || brief.trim().length < 10} onClick={() => runArchitect({ brief })}>
+                {busy ? "Designing…" : "Design architecture"}
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="card p-4">
+                <ManifestEditor value={manifest} onChange={setManifest} />
+              </div>
+
+              <div className="card space-y-3 p-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button className="btn-primary" disabled={generating || busy} onClick={generate}>
+                    {generating ? "Generating…" : "✓ Approve & generate code"}
+                  </button>
+                  <button className="btn-ghost" disabled={busy} onClick={() => saveManifest()}>
+                    Save manifest
+                  </button>
+                </div>
+                <div>
+                  <label className="label">Request architecture changes</label>
+                  <div className="flex gap-2">
+                    <input
+                      className="input flex-1"
+                      value={revisionNote}
+                      onChange={(e) => setRevisionNote(e.target.value)}
+                      placeholder="e.g. add a REST endpoint and split the admin class"
+                    />
+                    <button
+                      className="btn-ghost"
+                      disabled={busy || revisionNote.trim().length < 3}
+                      onClick={() => runArchitect({ brief: plugin.brief, revisionNote })}
+                    >
+                      {busy ? "Revising…" : "Re-design"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* FILES TAB */}
+      {tab === "files" && (
+        <div className="grid gap-4 lg:grid-cols-[260px_1fr]">
+          <ul className="card max-h-[70vh] overflow-auto p-2 text-sm">
+            {files.length === 0 && <li className="p-3 text-[var(--color-muted)]">No files yet.</li>}
+            {files.map((f) => (
+              <li key={f.id}>
+                <button
+                  onClick={() => setSelected(f.path)}
+                  className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left font-mono text-xs ${
+                    selectedFile?.path === f.path ? "bg-[var(--color-panel-2)]" : "hover:bg-[var(--color-panel-2)]"
+                  }`}
+                >
+                  <span className="truncate">{f.path}</span>
+                  <SeverityBadge severity={f.worstSeverity} />
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="card overflow-hidden">
+            {selectedFile ? (
+              <>
+                <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-2">
+                  <span className="font-mono text-xs">{selectedFile.path}</span>
+                  <span className="text-xs text-[var(--color-muted)]">{selectedFile.purpose}</span>
+                </div>
+                <pre className="max-h-[64vh] overflow-auto p-4 text-xs leading-relaxed">
+                  <code>{selectedFile.content}</code>
+                </pre>
+              </>
+            ) : (
+              <div className="p-6 text-sm text-[var(--color-muted)]">Select a file.</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ISSUES TAB */}
+      {tab === "issues" && (
+        <div className="space-y-2">
+          {findings.length === 0 ? (
+            <div className="card p-6 text-sm text-[var(--color-muted)]">
+              {hasFiles ? "No issues found 🎉" : "Generate the plugin to run reviews."}
+            </div>
+          ) : (
+            <>
+              <div className="flex gap-2 text-sm">
+                <span className="badge sev-critical">{critical} critical</span>
+                <span className="badge sev-high">{high} high</span>
+                <span className="text-[var(--color-muted)]">· {findings.length} total</span>
+              </div>
+              <ul className="space-y-2">
+                {findings.map((f) => (
+                  <li key={f.id} className="card p-3">
+                    <div className="mb-1 flex flex-wrap items-center gap-2">
+                      <SeverityBadge severity={f.severity} />
+                      <span className="badge bg-[var(--color-panel-2)] text-[var(--color-muted)]">{f.category}</span>
+                      <span className="font-mono text-xs text-[var(--color-muted)]">
+                        {f.filePath}{f.line ? `:${f.line}` : ""}
+                      </span>
+                      <span className="ml-auto text-[10px] uppercase text-[var(--color-muted)]">{f.source}</span>
+                    </div>
+                    <p className="text-sm">{f.message}</p>
+                    {f.suggestion && <p className="mt-1 text-xs text-[var(--color-muted)]">💡 {f.suggestion}</p>}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* LOG TAB */}
+      {tab === "log" && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="card p-4">
+            <h3 className="mb-2 text-sm font-semibold">Generation progress</h3>
+            {progress.length === 0 ? (
+              <p className="text-sm text-[var(--color-muted)]">No active run. Approve an architecture to generate.</p>
+            ) : (
+              <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap text-xs leading-relaxed">{progress.join("\n")}</pre>
+            )}
+            {generating && <p className="mt-2 animate-pulse text-xs text-[var(--color-accent)]">running…</p>}
+          </div>
+          <div className="card p-4">
+            <h3 className="mb-2 text-sm font-semibold">Conversation</h3>
+            <ul className="max-h-[60vh] space-y-3 overflow-auto">
+              {messages.map((m) => (
+                <li key={m.id}>
+                  <div className="mb-0.5 flex items-center gap-2 text-xs text-[var(--color-muted)]">
+                    <span className="font-semibold uppercase">{m.role}</span>
+                    {m.model && <span className="font-mono">{m.model}</span>}
+                  </div>
+                  <p className="whitespace-pre-wrap text-sm">{m.content}</p>
+                </li>
+              ))}
+              {messages.length === 0 && <li className="text-sm text-[var(--color-muted)]">No messages yet.</li>}
+            </ul>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

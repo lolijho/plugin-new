@@ -4,7 +4,10 @@
 FROM node:20-bookworm-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci
+# --include=dev forces devDependencies even when the platform injects
+# NODE_ENV=production at build time (Coolify does this). next build needs
+# typescript / tailwindcss / @tailwindcss/postcss, which live in devDependencies.
+RUN npm ci --include=dev
 
 # ── build: compile the Next.js app (standalone output) ───────────────────────
 FROM node:20-bookworm-slim AS build

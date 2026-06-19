@@ -72,6 +72,13 @@ embeddings key for semantic memory.
 
 > The app listens on port **3000**. Point your Coolify domain/proxy at it.
 
+> **Coolify tip — env vars at build time.** Mark secrets (`AUTH_SECRET`,
+> `OPENROUTER_API_KEY`, `EMBEDDINGS_API_KEY`, `DATABASE_URL`) and especially
+> **`NODE_ENV`** as **Runtime only** (uncheck *Available at Buildtime*). If
+> `NODE_ENV=production` is injected at build time, `npm` skips devDependencies and
+> the build fails. The Dockerfile guards against this with `npm ci --include=dev`,
+> but keeping secrets runtime-only is better practice anyway.
+
 ### Required environment variables
 See [`.env.example`](./.env.example) for the full list. Essentials:
 

@@ -35,6 +35,7 @@ export type FileForValidation = {
 export async function validateFiles(
   files: FileForValidation[],
   manifest: PluginManifest | null,
+  opts?: { wholePlugin?: boolean },
 ): Promise<ValidationResult[]> {
   const results: ValidationResult[] = [];
   const phpFiles = files.filter((f) => f.path.endsWith(".php"));
@@ -78,10 +79,18 @@ export async function validateFiles(
   // ── Per-file heuristic checks ───────────────────────────────────────────────
   for (const f of phpFiles) {
     const isIndexSilence = /(^|\/)index\.php$/.test(f.path) && f.content.length < 200;
+    const isUninstall = /(^|\/)uninstall\.php$/.test(f.path);
+    const isMain = Boolean(manifest && f.path === `${manifest.slug}.php`);
 
-    // ABSPATH guard
-    if (!isIndexSilence && !/defined\(\s*['"]ABSPATH['"]\s*\)/.test(f.content)) {
-      results.push(fail(f.path, "abspath-guard", "high", "Missing direct-access guard: add `if ( ! defined( 'ABSPATH' ) ) { exit; }` near the top."));
+    // Direct-access guard. Plugin files use ABSPATH; uninstall.php uses
+    // WP_UNINSTALL_PLUGIN; the index.php silence file needs neither.
+    const hasGuard =
+      /defined\(\s*['"]ABSPATH['"]\s*\)/.test(f.content) ||
+      /defined\(\s*['"]WP_UNINSTALL_PLUGIN['"]\s*\)/.test(f.content);
+    if (!isIndexSilence && !hasGuard) {
+      results.push(fail(f.path, "abspath-guard", "high", isUninstall
+        ? "Missing guard: add `if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) { exit; }` at the top of uninstall.php."
+        : "Missing direct-access guard: add `if ( ! defined( 'ABSPATH' ) ) { exit; }` near the top."));
     }
 
     // Closing tag at EOF
@@ -110,23 +119,25 @@ export async function validateFiles(
     if (/echo\s+\$[a-zA-Z_][\w]*\s*;/.test(f.content) && !/esc_/.test(f.content)) {
       results.push(fail(f.path, "escape-output", "medium", "Echoing a variable without an esc_*() escaping function (possible XSS)."));
     }
+
+    // Main-file-only checks (run on the single file when it IS the main file).
+    if (isMain) {
+      if (!/Plugin Name:\s*\S/.test(f.content)) {
+        results.push(fail(f.path, "plugin-header", "critical", "Main file is missing a valid `Plugin Name:` header block — WordPress will not recognize the plugin."));
+      }
+      if (manifest!.textDomain && !f.content.includes(manifest!.textDomain)) {
+        results.push(fail(f.path, "text-domain", "medium", `Declared text domain "${manifest!.textDomain}" not referenced in the main file.`));
+      }
+    }
   }
 
-  // ── Manifest-level checks ───────────────────────────────────────────────────
-  if (manifest) {
+  // ── Whole-plugin checks (only when validating the COMPLETE file set) ─────────
+  // Skipped during single-file builds, otherwise every non-main file would be
+  // falsely flagged as "main plugin file missing".
+  if (manifest && opts?.wholePlugin) {
     const mainFile = files.find((f) => f.path === `${manifest.slug}.php`);
     if (!mainFile) {
       results.push(fail(`${manifest.slug}.php`, "main-file", "critical", `Main plugin file "${manifest.slug}.php" is missing.`));
-    } else if (!/Plugin Name:\s*\S/.test(mainFile.content)) {
-      results.push(fail(mainFile.path, "plugin-header", "critical", "Main file is missing a valid `Plugin Name:` header block — WordPress will not recognize the plugin."));
-    } else {
-      results.push(ok(mainFile.path, "plugin-header", "Valid plugin header present"));
-    }
-
-    // Text domain consistency
-    const td = manifest.textDomain;
-    if (mainFile && td && !mainFile.content.includes(td)) {
-      results.push(fail(mainFile.path, "text-domain", "medium", `Declared text domain "${td}" not referenced in the main file.`));
     }
   }
 

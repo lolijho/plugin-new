@@ -111,21 +111,28 @@ async function runFilePipeline(args: {
   apiKey?: string;
   user: DbUser;
   maxFix: number;
+  /** When provided, skip the coder and review/fix this existing content instead. */
+  seed?: GeneratedFile;
   emit?: (e: RunEvent) => void;
 }): Promise<{ file: GeneratedFile; findings: ReviewFinding[]; validations: ValidationResult[]; usage: Usage }> {
   const usage = zeroUsage();
 
-  const coded = await runCoderForFile({
-    model: args.coderModel,
-    apiKey: args.apiKey,
-    temperature: resolveTemperature("coder", args.user),
-    manifest: args.manifest,
-    spec: args.spec,
-    written: args.written,
-  });
-  addUsage(usage, coded.usage);
-  let file = coded.file;
-  args.emit?.({ type: "file:coded", path: file.path });
+  let file: GeneratedFile;
+  if (args.seed) {
+    file = args.seed;
+  } else {
+    const coded = await runCoderForFile({
+      model: args.coderModel,
+      apiKey: args.apiKey,
+      temperature: resolveTemperature("coder", args.user),
+      manifest: args.manifest,
+      spec: args.spec,
+      written: args.written,
+    });
+    addUsage(usage, coded.usage);
+    file = coded.file;
+    args.emit?.({ type: "file:coded", path: file.path });
+  }
 
   let findings: ReviewFinding[] = [];
   let validations: ValidationResult[] = [];
@@ -353,6 +360,85 @@ export async function generateFile(
 
     const completion = await recomputeStatus(plugin.id, manifest);
     return { file, worst: res.worst, critical: res.critical, high: res.high, ...completion };
+  } catch (err) {
+    await finishGeneration(gen.id, "failed", undefined, errorMessage(err));
+    throw err;
+  }
+}
+
+type FileActionResult = {
+  worst: Severity | null;
+  critical: number;
+  high: number;
+  status: string;
+  createdCount: number;
+  total: number;
+};
+
+async function loadForAction(plugin: DbPlugin, path: string) {
+  const parsed = pluginManifestSchema.safeParse(plugin.manifest);
+  if (!parsed.success) throw new Error("No approved architecture manifest found.");
+  const manifest = parsed.data;
+  const spec = manifest.files.find((f) => f.path === path);
+  if (!spec) throw new Error(`File "${path}" is not part of the architecture.`);
+  const [row] = await db
+    .select()
+    .from(pluginFiles)
+    .where(and(eq(pluginFiles.pluginId, plugin.id), eq(pluginFiles.path, path)))
+    .limit(1);
+  if (!row) throw new Error(`File "${path}" has not been created yet — create it first.`);
+  const seed: GeneratedFile = { path: row.path, content: row.content, language: row.language, notes: "" };
+  return { manifest, spec, seed };
+}
+
+/** Re-review + re-validate an existing file WITHOUT changing its code. */
+export async function analyzeFile(plugin: DbPlugin, user: DbUser, path: string): Promise<FileActionResult> {
+  const { manifest, spec, seed } = await loadForAction(plugin, path);
+  const [gen] = await db.insert(generations).values({ pluginId: plugin.id, phase: "reviewing", status: "running" }).returning();
+  try {
+    const { file, findings, validations, usage } = await runFilePipeline({
+      manifest, spec, written: [],
+      coderModel: resolveModel("coder", { user, plugin }),
+      reviewerModel: resolveModel("reviewer", { user, plugin }),
+      apiKey: resolveApiKey(user), user, maxFix: 0, seed,
+    });
+    const res = await persistFile(plugin.id, gen.id, plugin.version, spec, file, findings, validations);
+    await finishGeneration(gen.id, "done", usage);
+    const completion = await recomputeStatus(plugin.id, manifest);
+    return { worst: res.worst, critical: res.critical, high: res.high, ...completion };
+  } catch (err) {
+    await finishGeneration(gen.id, "failed", undefined, errorMessage(err));
+    throw err;
+  }
+}
+
+/** Re-review an existing file and let the coder rewrite it to clear the issues. */
+export async function fixFile(plugin: DbPlugin, user: DbUser, path: string): Promise<FileActionResult> {
+  const { manifest, spec, seed } = await loadForAction(plugin, path);
+  // Other existing files give the fixer cross-file context.
+  const others = await db
+    .select({ path: pluginFiles.path, content: pluginFiles.content, language: pluginFiles.language })
+    .from(pluginFiles)
+    .where(eq(pluginFiles.pluginId, plugin.id));
+  const written: GeneratedFile[] = others
+    .filter((f) => f.path !== path)
+    .map((f) => ({ path: f.path, content: f.content, language: f.language, notes: "" }));
+
+  const [gen] = await db.insert(generations).values({ pluginId: plugin.id, phase: "generating", status: "running" }).returning();
+  try {
+    const { file, findings, validations, usage } = await runFilePipeline({
+      manifest, spec, written,
+      coderModel: resolveModel("coder", { user, plugin }),
+      reviewerModel: resolveModel("reviewer", { user, plugin }),
+      apiKey: resolveApiKey(user), user,
+      maxFix: Math.max(1, autofixIterations(user)),
+      seed,
+    });
+    const res = await persistFile(plugin.id, gen.id, plugin.version, spec, file, findings, validations);
+    await finishGeneration(gen.id, "done", usage);
+    await learnFromGeneration(plugin, user, gen.id, manifest);
+    const completion = await recomputeStatus(plugin.id, manifest);
+    return { worst: res.worst, critical: res.critical, high: res.high, ...completion };
   } catch (err) {
     await finishGeneration(gen.id, "failed", undefined, errorMessage(err));
     throw err;

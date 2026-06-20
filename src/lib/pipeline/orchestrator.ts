@@ -1,5 +1,5 @@
 import "server-only";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   plugins,
@@ -30,6 +30,14 @@ import {
   resolveTemperature,
   autofixIterations,
 } from "./resolve";
+
+type Usage = { promptTokens: number; completionTokens: number; costUsd: number };
+const zeroUsage = (): Usage => ({ promptTokens: 0, completionTokens: 0, costUsd: 0 });
+function addUsage(into: Usage, u: Usage) {
+  into.promptTokens += u.promptTokens;
+  into.completionTokens += u.completionTokens;
+  into.costUsd += u.costUsd;
+}
 
 // ── Architecture step (interactive checkpoint) ──────────────────────────────
 export async function architectPlugin(
@@ -93,7 +101,125 @@ export async function architectPlugin(
   }
 }
 
-// ── Generation run (code → review → validate → autofix) ─────────────────────
+// ── Core per-file pipeline (code → review → validate → autofix) ─────────────
+async function runFilePipeline(args: {
+  manifest: PluginManifest;
+  spec: PluginManifest["files"][number];
+  written: GeneratedFile[];
+  coderModel: string;
+  reviewerModel: string;
+  apiKey?: string;
+  user: DbUser;
+  maxFix: number;
+  emit?: (e: RunEvent) => void;
+}): Promise<{ file: GeneratedFile; findings: ReviewFinding[]; validations: ValidationResult[]; usage: Usage }> {
+  const usage = zeroUsage();
+
+  const coded = await runCoderForFile({
+    model: args.coderModel,
+    apiKey: args.apiKey,
+    temperature: resolveTemperature("coder", args.user),
+    manifest: args.manifest,
+    spec: args.spec,
+    written: args.written,
+  });
+  addUsage(usage, coded.usage);
+  let file = coded.file;
+  args.emit?.({ type: "file:coded", path: file.path });
+
+  let findings: ReviewFinding[] = [];
+  let validations: ValidationResult[] = [];
+  for (let iter = 0; iter <= args.maxFix; iter++) {
+    const review = await runReviewerForFile({
+      model: args.reviewerModel,
+      apiKey: args.apiKey,
+      temperature: resolveTemperature("reviewer", args.user),
+      manifest: args.manifest,
+      file,
+    });
+    addUsage(usage, review.usage);
+    findings = review.findings;
+    validations = await validateFiles([toValidation(file)], args.manifest);
+    args.emit?.({ type: "file:reviewed", path: file.path, findings: findings.length, worst: worstOf(findings, validations) });
+
+    const blocking = [
+      ...findings.filter((f) => f.severity === "critical" || f.severity === "high"),
+      ...validations.filter((v) => !v.passed && (v.severity === "critical" || v.severity === "high")),
+    ];
+    if (blocking.length === 0 || iter === args.maxFix) break;
+
+    const fixed = await runFixerForFile({
+      model: args.coderModel,
+      apiKey: args.apiKey,
+      temperature: resolveTemperature("coder", args.user),
+      manifest: args.manifest,
+      file,
+      findings,
+      validations,
+    });
+    addUsage(usage, fixed.usage);
+    file = fixed.file;
+    args.emit?.({ type: "file:fixed", path: file.path, iteration: iter + 1 });
+  }
+
+  return { file, findings, validations, usage };
+}
+
+/** Persist a freshly built file + its findings, replacing any prior version of that path. */
+async function persistFile(
+  pluginId: string,
+  generationId: string,
+  version: number,
+  spec: PluginManifest["files"][number],
+  file: GeneratedFile,
+  findings: ReviewFinding[],
+  validations: ValidationResult[],
+): Promise<{ worst: Severity | null; critical: number; high: number }> {
+  const worst = worstOf(findings, validations);
+
+  await db.delete(reviewFindings).where(and(eq(reviewFindings.pluginId, pluginId), eq(reviewFindings.filePath, file.path)));
+  await db.delete(pluginFiles).where(and(eq(pluginFiles.pluginId, pluginId), eq(pluginFiles.path, file.path)));
+
+  const [saved] = await db
+    .insert(pluginFiles)
+    .values({
+      pluginId,
+      generationId,
+      path: file.path,
+      language: file.language,
+      content: file.content,
+      purpose: spec.purpose,
+      worstSeverity: worst,
+      version,
+    })
+    .returning();
+
+  const all = [
+    ...findings.map((f) => ({ ...f, source: "reviewer" as const })),
+    ...validations.filter((v) => !v.passed).map((v) => ({ ...validationToFinding(v), source: "validator" as const })),
+  ];
+  let critical = 0;
+  let high = 0;
+  for (const f of all) {
+    if (f.severity === "critical") critical++;
+    if (f.severity === "high") high++;
+    await db.insert(reviewFindings).values({
+      pluginId,
+      generationId,
+      fileId: saved.id,
+      filePath: f.filePath || file.path,
+      severity: f.severity,
+      category: f.category,
+      line: f.line ?? null,
+      message: f.message,
+      suggestion: f.suggestion || null,
+      source: f.source,
+    });
+  }
+  return { worst, critical, high };
+}
+
+// ── Full run: build every file (streamed) ───────────────────────────────────
 export type RunEvent =
   | { type: "phase"; phase: string; message: string }
   | { type: "file:start"; path: string; index: number; total: number }
@@ -116,34 +242,23 @@ export async function generatePlugin(
     return;
   }
   const manifest = parsed.data;
-
-  await db.update(plugins).set({ status: "generating", version: plugin.version + 1, updatedAt: new Date() }).where(eq(plugins.id, plugin.id));
   const version = plugin.version + 1;
+
+  await db.update(plugins).set({ status: "generating", version, updatedAt: new Date() }).where(eq(plugins.id, plugin.id));
 
   const [gen] = await db
     .insert(generations)
     .values({ pluginId: plugin.id, phase: "generating", status: "running" })
     .returning();
 
-  const totalUsage = { promptTokens: 0, completionTokens: 0, costUsd: 0 };
-  const addUsage = (u: { promptTokens: number; completionTokens: number; costUsd: number }) => {
-    totalUsage.promptTokens += u.promptTokens;
-    totalUsage.completionTokens += u.completionTokens;
-    totalUsage.costUsd += u.costUsd;
-  };
+  const totalUsage = zeroUsage();
 
   try {
-    // Clear previous artifacts for this plugin (full regeneration).
+    // Full regeneration: clear previous artifacts.
     await db.delete(reviewFindings).where(eq(reviewFindings.pluginId, plugin.id));
     await db.delete(pluginFiles).where(eq(pluginFiles.pluginId, plugin.id));
 
-    // Retrieve memory once for the whole run.
-    const memories = await retrieveMemory({
-      userId: user.id,
-      pluginId: plugin.id,
-      query: `${plugin.brief}\n${manifest.summary}`,
-      limit: 8,
-    });
+    const memories = await retrieveMemory({ userId: user.id, pluginId: plugin.id, query: `${plugin.brief}\n${manifest.summary}`, limit: 8 });
     const memoryBlock = formatMemoriesForPrompt(memories);
     if (memories.length) emit({ type: "log", message: `Recalled ${memories.length} relevant memories.` });
 
@@ -160,107 +275,22 @@ export async function generatePlugin(
       const spec = manifest.files[i];
       emit({ type: "file:start", path: spec.path, index: i + 1, total: manifest.files.length });
 
-      // 1) Code the file.
-      const coded = await runCoderForFile({
-        model: coderModel,
-        apiKey,
-        temperature: resolveTemperature("coder", user),
-        manifest,
-        spec,
-        written,
+      const { file, findings, validations, usage } = await runFilePipeline({
+        manifest, spec, written, coderModel, reviewerModel, apiKey, user, maxFix, emit,
       });
-      addUsage(coded.usage);
-      let file = coded.file;
-      emit({ type: "file:coded", path: file.path });
+      addUsage(totalUsage, usage);
 
-      // 2) Review + validate, with an autofix loop for critical/high issues.
-      let findings: ReviewFinding[] = [];
-      let validations: ValidationResult[] = [];
-      for (let iter = 0; iter <= maxFix; iter++) {
-        const review = await runReviewerForFile({
-          model: reviewerModel,
-          apiKey,
-          temperature: resolveTemperature("reviewer", user),
-          manifest,
-          file,
-        });
-        addUsage(review.usage);
-        findings = review.findings;
-        validations = await validateFiles([toValidation(file)], manifest);
-        emit({
-          type: "file:reviewed",
-          path: file.path,
-          findings: findings.length,
-          worst: worstOf(findings, validations),
-        });
-
-        const blocking = [
-          ...findings.filter((f) => f.severity === "critical" || f.severity === "high"),
-          ...validations.filter((v) => !v.passed && (v.severity === "critical" || v.severity === "high")).map(validationToFinding),
-        ];
-        if (blocking.length === 0 || iter === maxFix) break;
-
-        const fixed = await runFixerForFile({
-          model: coderModel,
-          apiKey,
-          temperature: resolveTemperature("coder", user),
-          manifest,
-          file,
-          findings,
-          validations,
-        });
-        addUsage(fixed.usage);
-        file = fixed.file;
-        emit({ type: "file:fixed", path: file.path, iteration: iter + 1 });
-      }
-
-      // 3) Persist the file + findings.
-      const worst = worstOf(findings, validations);
-      const [savedFile] = await db
-        .insert(pluginFiles)
-        .values({
-          pluginId: plugin.id,
-          generationId: gen.id,
-          path: file.path,
-          language: file.language,
-          content: file.content,
-          purpose: spec.purpose,
-          worstSeverity: worst,
-          version,
-        })
-        .returning();
-
-      const allFindings = [
-        ...findings.map((f) => ({ ...f, source: "reviewer" as const })),
-        ...validations.filter((v) => !v.passed).map((v) => ({ ...validationToFinding(v), source: "validator" as const })),
-      ];
-      for (const f of allFindings) {
-        if (f.severity === "critical") critical++;
-        if (f.severity === "high") high++;
-        await db.insert(reviewFindings).values({
-          pluginId: plugin.id,
-          generationId: gen.id,
-          fileId: savedFile.id,
-          filePath: f.filePath || file.path,
-          severity: f.severity,
-          category: f.category,
-          line: f.line ?? null,
-          message: f.message,
-          suggestion: f.suggestion || null,
-          source: f.source,
-        });
-      }
-
+      const res = await persistFile(plugin.id, gen.id, version, spec, file, findings, validations);
+      critical += res.critical;
+      high += res.high;
       written.push(file);
-      emit({ type: "file:done", path: file.path, worst });
+      emit({ type: "file:done", path: file.path, worst: res.worst });
     }
 
     const status = critical > 0 ? "needs_fixes" : "ready";
     await db.update(plugins).set({ status, updatedAt: new Date() }).where(eq(plugins.id, plugin.id));
     await finishGeneration(gen.id, "done", totalUsage);
-
-    // 4) Learn: persist lessons from what went wrong (and the overall shape).
-    await learnFromRun(plugin, user, gen.id, manifest, written.length, critical, high);
+    await learnFromGeneration(plugin, user, gen.id, manifest);
 
     emit({ type: "done", status, critical, high });
   } catch (err) {
@@ -270,26 +300,97 @@ export async function generatePlugin(
   }
 }
 
-// ── Learning ────────────────────────────────────────────────────────────────
-async function learnFromRun(
+// ── Single-file build (incremental, resumable) ──────────────────────────────
+export async function generateFile(
   plugin: DbPlugin,
   user: DbUser,
-  generationId: string,
+  path: string,
+): Promise<{ file: GeneratedFile; worst: Severity | null; critical: number; high: number; status: string; createdCount: number; total: number }> {
+  const parsed = pluginManifestSchema.safeParse(plugin.manifest);
+  if (!parsed.success) throw new Error("No approved architecture manifest found.");
+  const manifest = parsed.data;
+
+  const spec = manifest.files.find((f) => f.path === path);
+  if (!spec) throw new Error(`File "${path}" is not part of the architecture.`);
+
+  // Context = the other files already written, for cross-file consistency.
+  const existing = await db
+    .select({ path: pluginFiles.path, content: pluginFiles.content, language: pluginFiles.language })
+    .from(pluginFiles)
+    .where(eq(pluginFiles.pluginId, plugin.id));
+  const written: GeneratedFile[] = existing
+    .filter((f) => f.path !== path)
+    .map((f) => ({ path: f.path, content: f.content, language: f.language, notes: "" }));
+
+  const [gen] = await db
+    .insert(generations)
+    .values({ pluginId: plugin.id, phase: "generating", status: "running" })
+    .returning();
+
+  if (plugin.status === "awaiting_approval" || plugin.status === "draft") {
+    await db.update(plugins).set({ status: "generating", updatedAt: new Date() }).where(eq(plugins.id, plugin.id));
+  }
+
+  try {
+    const memories = await retrieveMemory({ userId: user.id, pluginId: plugin.id, query: `${manifest.summary}\n${spec.purpose}\n${spec.path}`, limit: 6 });
+
+    const { file, findings, validations, usage } = await runFilePipeline({
+      manifest,
+      spec,
+      written,
+      coderModel: resolveModel("coder", { user, plugin }),
+      reviewerModel: resolveModel("reviewer", { user, plugin }),
+      apiKey: resolveApiKey(user),
+      user,
+      maxFix: autofixIterations(user),
+      // memoryBlock is folded into the coder via prompts; keep single-file lean
+    });
+    void memories; // retrieval also warms importance / future semantic use
+
+    const res = await persistFile(plugin.id, gen.id, plugin.version, spec, file, findings, validations);
+    await finishGeneration(gen.id, "done", usage);
+    await learnFromGeneration(plugin, user, gen.id, manifest);
+
+    const completion = await recomputeStatus(plugin.id, manifest);
+    return { file, worst: res.worst, critical: res.critical, high: res.high, ...completion };
+  } catch (err) {
+    await finishGeneration(gen.id, "failed", undefined, errorMessage(err));
+    throw err;
+  }
+}
+
+/** Recompute plugin status from how many manifest files now exist + their severity. */
+async function recomputeStatus(
+  pluginId: string,
   manifest: PluginManifest,
-  fileCount: number,
-  critical: number,
-  high: number,
-) {
-  // Record concrete mistakes (critical/high) so future plugins avoid them.
-  const rows = await db
-    .select()
-    .from(reviewFindings)
-    .where(and(eq(reviewFindings.generationId, generationId)));
+): Promise<{ status: string; createdCount: number; total: number }> {
+  const created = await db.select({ path: pluginFiles.path }).from(pluginFiles).where(eq(pluginFiles.pluginId, pluginId));
+  const createdSet = new Set(created.map((c) => c.path));
+  const total = manifest.files.length;
+  const allDone = manifest.files.every((f) => createdSet.has(f.path));
+
+  let status: "ready" | "needs_fixes" | "generating";
+  if (allDone) {
+    const [{ n }] = await db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(reviewFindings)
+      .where(and(eq(reviewFindings.pluginId, pluginId), eq(reviewFindings.severity, "critical")));
+    status = n > 0 ? "needs_fixes" : "ready";
+  } else {
+    status = "generating";
+  }
+  await db.update(plugins).set({ status, updatedAt: new Date() }).where(eq(plugins.id, pluginId));
+  return { status, createdCount: createdSet.size, total };
+}
+
+// ── Learning ────────────────────────────────────────────────────────────────
+async function learnFromGeneration(plugin: DbPlugin, user: DbUser, generationId: string, manifest: PluginManifest) {
+  const rows = await db.select().from(reviewFindings).where(eq(reviewFindings.generationId, generationId));
   const serious = rows.filter((r) => r.severity === "critical" || r.severity === "high").slice(0, 12);
   for (const r of serious) {
     await storeMemoryDeduped({
       userId: user.id,
-      pluginId: null, // cross-plugin: applies to all future work
+      pluginId: null,
       kind: "error",
       title: `${r.category}: ${r.message}`.slice(0, 200),
       content: `In "${manifest.name}" (${r.filePath}) the issue was: ${r.message}. Fix: ${r.suggestion ?? "apply the WP standard for this category"}. Avoid repeating this.`,
@@ -298,18 +399,6 @@ async function learnFromRun(
       sourceGenerationId: generationId,
     });
   }
-
-  // Record the architecture as a reusable pattern.
-  await storeMemoryDeduped({
-    userId: user.id,
-    pluginId: plugin.id,
-    kind: "pattern",
-    title: `Architecture for "${manifest.name}"`,
-    content: `${manifest.summary} Files: ${manifest.files.map((f) => f.path).join(", ")}. ${manifest.database.length ? "Data: " + manifest.database.map((d) => `${d.kind}:${d.name}`).join(", ") + "." : ""} Generated ${fileCount} files with ${critical} critical / ${high} high issues remaining.`,
-    tags: ["architecture", manifest.slug],
-    importance: 1,
-    sourceGenerationId: generationId,
-  });
 }
 
 // ── DB helpers ──────────────────────────────────────────────────────────────
@@ -323,24 +412,10 @@ async function logMessage(
   promptTokens = 0,
   completionTokens = 0,
 ) {
-  await db.insert(messages).values({
-    pluginId,
-    generationId,
-    role,
-    phase,
-    content,
-    model: model ?? null,
-    promptTokens,
-    completionTokens,
-  });
+  await db.insert(messages).values({ pluginId, generationId, role, phase, content, model: model ?? null, promptTokens, completionTokens });
 }
 
-async function finishGeneration(
-  id: string,
-  status: "done" | "failed",
-  usage?: { promptTokens: number; completionTokens: number; costUsd: number },
-  error?: string,
-) {
+async function finishGeneration(id: string, status: "done" | "failed", usage?: Usage, error?: string) {
   await db
     .update(generations)
     .set({
@@ -363,7 +438,12 @@ function validationToFinding(v: ValidationResult): ReviewFinding {
   return {
     filePath: v.filePath,
     severity: v.severity,
-    category: v.check.includes("sql") || v.check.includes("escape") || v.check.includes("input") || v.check.includes("dangerous") ? "security" : v.check.includes("lint") || v.check.includes("main") || v.check.includes("header") ? "fatal" : "standards",
+    category:
+      v.check.includes("sql") || v.check.includes("escape") || v.check.includes("input") || v.check.includes("dangerous")
+        ? "security"
+        : v.check.includes("lint") || v.check.includes("main") || v.check.includes("header")
+          ? "fatal"
+          : "standards",
     line: v.line ?? null,
     message: v.message,
     suggestion: "",

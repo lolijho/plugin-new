@@ -6,6 +6,7 @@ import type { PluginManifest } from "@/lib/types";
 import StatusBadge from "@/components/StatusBadge";
 import SeverityBadge from "@/components/SeverityBadge";
 import ManifestEditor from "./ManifestEditor";
+import BuildStructure from "./BuildStructure";
 
 type FileRow = {
   id: string;
@@ -44,7 +45,7 @@ type PluginRow = {
   version: number;
 };
 
-type Tab = "architecture" | "files" | "issues" | "log";
+type Tab = "architecture" | "structure" | "files" | "issues" | "log";
 
 export default function PluginWorkspace() {
   const { id } = useParams<{ id: string }>();
@@ -80,7 +81,14 @@ export default function PluginWorkspace() {
     setMessages(data.messages ?? []);
     setBrief((b) => b || data.plugin.brief || "");
     if (data.plugin.manifest) setManifest((m) => m ?? data.plugin.manifest);
-    if ((data.files?.length ?? 0) > 0) setTab((t) => (t === "architecture" ? "files" : t));
+    const fileCount = data.files?.length ?? 0;
+    const totalFiles = data.plugin.manifest?.files?.length ?? 0;
+    setTab((t) => {
+      if (t !== "architecture") return t; // don't fight manual navigation
+      if (data.plugin.manifest && fileCount < totalFiles) return "structure";
+      if (fileCount > 0) return "files";
+      return t;
+    });
     return data.plugin as PluginRow;
   }, [id]);
 
@@ -132,6 +140,19 @@ export default function PluginWorkspace() {
     if (!res.ok && !silent) {
       const d = await res.json();
       setError(d.error ?? "Could not save manifest");
+    }
+  }
+
+  async function approveAndStructure() {
+    if (!manifest) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await saveManifest(true);
+      await load();
+      setTab("structure");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -195,6 +216,7 @@ export default function PluginWorkspace() {
   if (!plugin) return <div className="text-sm text-[var(--color-muted)]">Loading…</div>;
 
   const hasFiles = files.length > 0;
+  const builtCount = manifest ? manifest.files.filter((mf) => files.some((f) => f.path === mf.path)).length : 0;
   const critical = findings.filter((f) => f.severity === "critical").length;
   const high = findings.filter((f) => f.severity === "high").length;
   const selectedFile = files.find((f) => f.path === selected) ?? files[0] ?? null;
@@ -226,7 +248,7 @@ export default function PluginWorkspace() {
 
       {/* Tabs */}
       <div className="flex gap-1 border-b border-[var(--color-border)]">
-        {(["architecture", "files", "issues", "log"] as Tab[]).map((tb) => (
+        {(["architecture", "structure", "files", "issues", "log"] as Tab[]).map((tb) => (
           <button
             key={tb}
             onClick={() => setTab(tb)}
@@ -242,6 +264,9 @@ export default function PluginWorkspace() {
             )}
             {tb === "files" && hasFiles && (
               <span className="ml-1.5 rounded bg-[var(--color-panel-2)] px-1.5 text-xs">{files.length}</span>
+            )}
+            {tb === "structure" && manifest && (
+              <span className="ml-1.5 rounded bg-[var(--color-panel-2)] px-1.5 text-xs">{builtCount}/{manifest.files.length}</span>
             )}
           </button>
         ))}
@@ -271,11 +296,14 @@ export default function PluginWorkspace() {
 
               <div className="card space-y-3 p-4">
                 <div className="flex flex-wrap items-center gap-2">
-                  <button className="btn-primary" disabled={generating || busy} onClick={generate}>
-                    {generating ? "Generating…" : "✓ Approve & generate code"}
+                  <button className="btn-primary" disabled={busy || generating} onClick={approveAndStructure}>
+                    {busy ? "Salvataggio…" : "✓ Approva e crea la struttura"}
                   </button>
                   <button className="btn-ghost" disabled={busy} onClick={() => saveManifest()}>
-                    Save manifest
+                    Salva manifest
+                  </button>
+                  <button className="btn-ghost" disabled={generating || busy} onClick={generate}>
+                    {generating ? "Generating…" : "Genera tutto in un colpo (streaming)"}
                   </button>
                 </div>
                 <div>
@@ -301,6 +329,23 @@ export default function PluginWorkspace() {
           )}
         </div>
       )}
+
+      {/* STRUCTURE TAB */}
+      {tab === "structure" &&
+        (manifest ? (
+          <BuildStructure
+            pluginId={id}
+            manifest={manifest}
+            createdFiles={files.map((f) => ({ path: f.path, worstSeverity: f.worstSeverity }))}
+            onChanged={async () => {
+              await load();
+            }}
+          />
+        ) : (
+          <div className="card p-6 text-sm text-[var(--color-muted)]">
+            Progetta prima l&apos;architettura nella scheda Architecture.
+          </div>
+        ))}
 
       {/* FILES TAB */}
       {tab === "files" && (

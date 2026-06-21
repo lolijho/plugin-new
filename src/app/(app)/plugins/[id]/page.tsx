@@ -374,15 +374,40 @@ export default function PluginWorkspace() {
 
       {error && <div className="rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">{error}</div>}
 
-      {/* Critical-error fix tool */}
+      {/* Critical-error fix tool — shows WHAT the error is, not just the count */}
       {criticalFiles.length > 0 && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3">
-          <div className="text-sm text-red-200">
-            ⚠ Questo plugin ha <b>errori critici</b> in {criticalFiles.length} file. Lo strumento li mette in coda e fa riscrivere i file dal correttore (Claude) finché i critici sono risolti.
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="text-sm text-red-200">
+              ⚠ <b>{critical} {critical === 1 ? "errore critico" : "errori critici"}</b> in {criticalFiles.length} file:
+            </div>
+            <button className="btn-primary shrink-0" onClick={() => fixCritical(["critical", "high"])}>
+              🛠️ Risolvi errori critici ({criticalFiles.length})
+            </button>
           </div>
-          <button className="btn-primary shrink-0" onClick={() => fixCritical(["critical", "high"])}>
-            🛠️ Risolvi errori critici ({criticalFiles.length})
-          </button>
+          <ul className="mt-2 space-y-1.5 text-xs">
+            {findings.filter((f) => f.severity === "critical").slice(0, 6).map((f) => (
+              <li key={f.id} className="text-red-200/90">
+                <button
+                  className="font-mono text-red-300 hover:underline"
+                  onClick={() => { setSelected(f.filePath); setTab("files"); }}
+                  title="Apri il file"
+                >
+                  {f.filePath}{f.line ? `:${f.line}` : ""}
+                </button>{" "}
+                — {f.message}
+                {f.suggestion && <span className="text-[var(--color-muted)]"> · 💡 {f.suggestion}</span>}
+              </li>
+            ))}
+            {critical > 6 && (
+              <li className="text-[var(--color-muted)]">
+                …e altri {critical - 6}.{" "}
+                <button className="text-[var(--color-accent)] hover:underline" onClick={() => setTab("issues")}>
+                  Apri la scheda Issues
+                </button>
+              </li>
+            )}
+          </ul>
         </div>
       )}
 

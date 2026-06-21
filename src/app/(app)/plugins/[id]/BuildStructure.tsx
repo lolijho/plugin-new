@@ -203,7 +203,16 @@ export default function BuildStructure({
             <div className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-muted)]">Spesa OpenRouter</div>
             <div className="text-lg font-bold tabular-nums text-emerald-300">{fmtCost(costShown)}</div>
           </div>
-          <button className="btn-ghost" disabled={pendingPaths.length === 0} onClick={() => enqueue(pendingPaths.map((p) => ({ path: p, action: "generate-file" as const })))}>
+          <button
+            className="btn-ghost"
+            disabled={pendingPaths.length === 0}
+            onClick={() => {
+              // Build the main/bootstrap file last so it sees every class signature.
+              const main = `${manifest.slug}.php`;
+              const ordered = [...pendingPaths.filter((p) => p !== main), ...pendingPaths.filter((p) => p === main)];
+              enqueue(ordered.map((p) => ({ path: p, action: "generate-file" as const })));
+            }}
+          >
             ＋ Coda tutti i rimanenti ({pendingPaths.length})
           </button>
         </div>

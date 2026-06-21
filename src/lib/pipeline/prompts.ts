@@ -10,6 +10,29 @@ plugins to the wordpress.org repository. You know the Plugin Handbook, the
 WordPress Coding Standards (WPCS), and the Plugin Security guidelines by heart.
 
 NON-NEGOTIABLE RULES (a violation is a critical bug):
+0. SIGNATURE & CALL-SITE CONSISTENCY (TOP PRIORITY — the #1 cause of WordPress
+   "critical error": ArgumentCountError, TypeError "must be of type", and
+   "Call to undefined method/function"). Consistency between DEFINITION and USE
+   is NOT negotiable.
+   - Argument count, order and TYPE at every call site MUST match the real
+     definition. Before writing \`new Class(...)\` or any function/method call,
+     re-read that class/function's actual signature and check argument by argument.
+   - If you change a signature (e.g. add a dependency to a constructor), update
+     EVERY place that instantiates/calls it IN THE SAME PASS. Never leave a call
+     site out of sync.
+   - DEPENDENCY INJECTION: keep an explicit "class -> required dependencies" map.
+     The central bootstrap/orchestrator builds dependencies in correct order and
+     passes ALL of them to each \`new\`.
+   - LIFECYCLE: if a class has run()/init()/boot() that registers hooks
+     (add_action/add_filter), it MUST be called after instantiation — instantiating
+     without calling init() is a bug.
+   - Never call a method/function that isn't defined; never use a class before it
+     is loaded/required; never use a variable/property before it is assigned.
+   - Every hook (activation, wp_ajax_*, admin menu, shortcode) must point to a
+     method/function that actually exists with the right signature.
+   - In constructors that require dependencies, validate them with instanceof and
+     fail gracefully (admin_notice + return), instead of letting
+     ArgumentCountError/TypeError reach WordPress.
 1. SECURITY
    - Every PHP file starts with: if ( ! defined( 'ABSPATH' ) ) { exit; }
    - Escape ALL output at the point of output: esc_html(), esc_attr(), esc_url(),
@@ -61,6 +84,13 @@ Output a single JSON object matching the provided schema. It must include:
   readme.txt, an index.php silence file in each PHP directory, and all class/asset
   files. Each file lists concrete responsibilities (hooks, functions, classes).
 - All hooks/filters with their callbacks and purpose.
+- CONTRACTS (critical to avoid ArgumentCountError/TypeError): for every class, state
+  in its file's responsibilities the EXACT constructor signature (parameter names +
+  types) and the public method signatures. Include an explicit dependency map
+  ("class -> required dependencies") and the instantiation ORDER, and require the
+  main file/bootstrap to build all dependencies in that order, pass them to each
+  \`new\`, and call each component's init()/run(). The coder will follow these
+  signatures verbatim, so keep them consistent across every file.
 - The data model (custom tables with dbDelta, options, CPTs, taxonomies, meta).
 - Explicit security considerations addressed (nonces, capabilities, escaping,
   sanitization, prepared statements).
@@ -81,11 +111,26 @@ file — no placeholders, no "// TODO", no truncation, no ellipses.
 Hard requirements for the file you produce:
 - It must be internally consistent with the manifest (prefixes, text domain, class
   and function names, file paths it require()s).
+- SIGNATURE CONSISTENCY (TOP PRIORITY): every call site must match the real
+  definition. Before writing \`new X(...)\` or any function/method call, re-read X's
+  signature in the already-written files / the manifest contracts and verify
+  argument count, ORDER and TYPE. If you are the bootstrap/orchestrator, construct
+  every dependency in the manifest's order and pass ALL of them to each \`new\`, then
+  call each component's init()/run(). Validate constructor dependencies with
+  instanceof and fail with an admin_notice instead of letting a fatal error happen.
 - PHP files: open with <?php, include the ABSPATH guard, follow every security rule
   above, and have NO syntax errors. Do not include a closing ?> tag.
 - Reference other files using plugin_dir_path( __FILE__ ) / relative require_once.
 - Match WordPress Coding Standards (Yoda conditions, spacing, docblocks).
 - readme.txt must follow the wordpress.org readme format.
+
+Before returning, run this self-check and fix anything that fails:
+  [ ] every \`new\`/call matches a real signature (count/order/type);
+  [ ] every method/function used exists with the right signature;
+  [ ] every class is required/loaded before use;
+  [ ] no variable/property is used before assignment;
+  [ ] every hook (activation, wp_ajax_*, menu, shortcode) points to an existing callback;
+  [ ] each init()/run() that registers hooks is actually invoked.
 
 Return ONLY the JSON object for this one file (path, language, content, notes).
 "content" is the raw file content (it will be written verbatim to disk).`;
@@ -97,6 +142,13 @@ export function reviewerSystemPrompt(): string {
 YOUR ROLE: SECURITY & QA REVIEWER (adversarial).
 Review the provided plugin file(s) against every rule above. Hunt specifically for
 issues that would BREAK the plugin or create vulnerabilities:
+- SIGNATURE/CALL-SITE MISMATCH (the #1 critical error): \`new Class(...)\` or any
+  call whose argument count/order/type differs from the definition
+  (ArgumentCountError / TypeError "must be of type"); methods or functions called
+  but never defined ("Call to undefined method/function"); a class used before it
+  is loaded; constructor dependencies not injected; an init()/run() that registers
+  hooks but is never called after instantiation; a hook wired to a non-existent
+  callback. Flag these as critical.
 - Fatal errors / parse errors / undefined functions or classes / wrong PHP version syntax.
 - Missing ABSPATH guard.
 - Unescaped output (XSS), unsanitized input, missing nonce/capability checks.

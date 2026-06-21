@@ -459,6 +459,51 @@ export async function fixFile(plugin: DbPlugin, user: DbUser, path: string, emit
   }
 }
 
+/** Save a manually-edited file: persist content + re-run the free deterministic
+ *  validators (php -l, security heuristics) and refresh the file's findings. */
+export async function updateFileContent(
+  plugin: DbPlugin,
+  user: DbUser,
+  fileId: string,
+  content: string,
+): Promise<{ worst: Severity | null; status: string | null }> {
+  void user;
+  const [row] = await db
+    .select()
+    .from(pluginFiles)
+    .where(and(eq(pluginFiles.id, fileId), eq(pluginFiles.pluginId, plugin.id)))
+    .limit(1);
+  if (!row) throw new Error("File not found");
+
+  const manifest = pluginManifestSchema.safeParse(plugin.manifest).data ?? null;
+  const validations = await validateFiles([{ path: row.path, content, language: row.language }], manifest);
+
+  // Replace only the validator-sourced findings for this file; keep reviewer ones
+  // until the user re-runs "Analizza".
+  await db.delete(reviewFindings).where(and(eq(reviewFindings.fileId, fileId), eq(reviewFindings.source, "validator")));
+  for (const v of validations.filter((x) => !x.passed)) {
+    const f = validationToFinding(v);
+    await db.insert(reviewFindings).values({
+      pluginId: plugin.id,
+      fileId,
+      filePath: row.path,
+      severity: f.severity,
+      category: f.category,
+      line: f.line ?? null,
+      message: f.message,
+      source: "validator",
+    });
+  }
+
+  const current = await db.select({ severity: reviewFindings.severity }).from(reviewFindings).where(eq(reviewFindings.fileId, fileId));
+  const worst = maxSeverity(current.map((c) => c.severity));
+
+  await db.update(pluginFiles).set({ content, worstSeverity: worst, updatedAt: new Date() }).where(eq(pluginFiles.id, fileId));
+
+  const completion = manifest ? await recomputeStatus(plugin.id, manifest) : null;
+  return { worst, status: completion?.status ?? null };
+}
+
 /** Recompute plugin status from how many manifest files now exist + their severity. */
 async function recomputeStatus(
   pluginId: string,
@@ -569,6 +614,12 @@ function worstOf(findings: ReviewFinding[], validations: ValidationResult[]): Se
   };
   for (const f of findings) consider(f.severity);
   for (const v of validations) if (!v.passed) consider(v.severity);
+  return worst;
+}
+
+function maxSeverity(severities: Severity[]): Severity | null {
+  let worst: Severity | null = null;
+  for (const s of severities) if (worst === null || severityRank[s] > severityRank[worst]) worst = s;
   return worst;
 }
 

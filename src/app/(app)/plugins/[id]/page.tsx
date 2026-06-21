@@ -68,6 +68,12 @@ export default function PluginWorkspace() {
   const [error, setError] = useState<string | null>(null);
   const started = useRef(false);
 
+  // Manual file editing (Files tab)
+  const [editing, setEditing] = useState(false);
+  const [editContent, setEditContent] = useState("");
+  const [savingFile, setSavingFile] = useState(false);
+  const [fileMsg, setFileMsg] = useState<string | null>(null);
+
   const load = useCallback(async () => {
     const res = await fetch(`/api/plugins/${id}`);
     if (!res.ok) {
@@ -210,6 +216,30 @@ export default function PluginWorkspace() {
     if (!confirm("Delete this plugin and all its files?")) return;
     await fetch(`/api/plugins/${id}`, { method: "DELETE" });
     router.push("/");
+  }
+
+  async function saveFile() {
+    const sf = files.find((f) => f.path === selected) ?? files[0] ?? null;
+    if (!sf) return;
+    setSavingFile(true);
+    setFileMsg(null);
+    try {
+      const res = await fetch(`/api/plugins/${id}/files/${sf.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: editContent }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Salvataggio fallito");
+      setEditing(false);
+      setFileMsg("Salvato ✓");
+      await load();
+      setTimeout(() => setFileMsg(null), 2500);
+    } catch (err) {
+      setFileMsg(err instanceof Error ? err.message : "errore");
+    } finally {
+      setSavingFile(false);
+    }
   }
 
   if (error && !plugin) return <div className="card p-6 text-red-300">{error}</div>;
@@ -355,7 +385,7 @@ export default function PluginWorkspace() {
             {files.map((f) => (
               <li key={f.id}>
                 <button
-                  onClick={() => setSelected(f.path)}
+                  onClick={() => { setSelected(f.path); setEditing(false); setFileMsg(null); }}
                   className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left font-mono text-xs ${
                     selectedFile?.path === f.path ? "bg-[var(--color-panel-2)]" : "hover:bg-[var(--color-panel-2)]"
                   }`}
@@ -369,13 +399,38 @@ export default function PluginWorkspace() {
           <div className="card overflow-hidden">
             {selectedFile ? (
               <>
-                <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-2">
-                  <span className="font-mono text-xs">{selectedFile.path}</span>
-                  <span className="text-xs text-[var(--color-muted)]">{selectedFile.purpose}</span>
+                <div className="flex items-center justify-between gap-2 border-b border-[var(--color-border)] px-4 py-2">
+                  <span className="truncate font-mono text-xs">{selectedFile.path}</span>
+                  <div className="flex shrink-0 items-center gap-2">
+                    {fileMsg && <span className="text-xs text-emerald-300">{fileMsg}</span>}
+                    {editing ? (
+                      <>
+                        <button className="btn-ghost px-2.5 py-1 text-xs" disabled={savingFile} onClick={() => { setEditing(false); setFileMsg(null); }}>
+                          Annulla
+                        </button>
+                        <button className="btn-primary px-2.5 py-1 text-xs" disabled={savingFile} onClick={saveFile}>
+                          {savingFile ? "Salvataggio…" : "Salva"}
+                        </button>
+                      </>
+                    ) : (
+                      <button className="btn-ghost px-2.5 py-1 text-xs" onClick={() => { setEditContent(selectedFile.content); setEditing(true); setFileMsg(null); }}>
+                        ✎ Modifica
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <pre className="max-h-[64vh] overflow-auto p-4 text-xs leading-relaxed">
-                  <code>{selectedFile.content}</code>
-                </pre>
+                {editing ? (
+                  <textarea
+                    className="block h-[64vh] w-full resize-none bg-[var(--color-bg)] p-4 font-mono text-xs leading-relaxed text-[var(--color-text)] outline-none"
+                    spellCheck={false}
+                    value={editContent}
+                    onChange={(e) => setEditContent(e.target.value)}
+                  />
+                ) : (
+                  <pre className="max-h-[64vh] overflow-auto p-4 text-xs leading-relaxed">
+                    <code>{selectedFile.content}</code>
+                  </pre>
+                )}
               </>
             ) : (
               <div className="p-6 text-sm text-[var(--color-muted)]">Select a file.</div>

@@ -25,12 +25,13 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   if (files.length === 0) return badRequest("No generated files to download yet.");
 
   const slug = plugin.slug || "plugin";
+  const version = (plugin.manifest as { version?: string } | null)?.version || String(plugin.version);
   const zip = await buildPluginZip(slug, files);
 
   return new Response(Buffer.from(zip), {
     headers: {
       "Content-Type": "application/zip",
-      "Content-Disposition": `attachment; filename="${slug}.zip"`,
+      "Content-Disposition": `attachment; filename="${slug}-${version}.zip"`,
       "Content-Length": String(zip.byteLength),
     },
   });

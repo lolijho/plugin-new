@@ -374,6 +374,9 @@ export async function generateFile(
     await learnFromGeneration(plugin, user, gen.id, manifest);
     emit?.({ type: "file:done", path, worst: res.worst });
 
+    // Regenerating an existing file is a modification → bump the version.
+    if (existing.some((f) => f.path === path)) await bumpVersion(plugin.id);
+
     const completion = await recomputeStatus(plugin.id, manifest);
     return { file, worst: res.worst, critical: res.critical, high: res.high, ...completion };
   } catch (err) {
@@ -457,6 +460,7 @@ export async function fixFile(plugin: DbPlugin, user: DbUser, path: string, emit
     await finishGeneration(gen.id, "done", usage);
     await learnFromGeneration(plugin, user, gen.id, manifest);
     emit?.({ type: "file:done", path, worst: res.worst });
+    await bumpVersion(plugin.id);
     const completion = await recomputeStatus(plugin.id, manifest);
     return { worst: res.worst, critical: res.critical, high: res.high, ...completion };
   } catch (err) {
@@ -506,6 +510,7 @@ export async function updateFileContent(
 
   await db.update(pluginFiles).set({ content, worstSeverity: worst, updatedAt: new Date() }).where(eq(pluginFiles.id, fileId));
 
+  await bumpVersion(plugin.id);
   const completion = manifest ? await recomputeStatus(plugin.id, manifest) : null;
   return { worst, status: completion?.status ?? null };
 }
@@ -704,6 +709,57 @@ export async function diagnosePlugin(
     await finishGeneration(gen.id, "failed", undefined, errorMessage(err));
     throw err;
   }
+}
+
+function incrementPatch(v: string): string {
+  const m = v.match(/^(\d+)\.(\d+)\.(\d+)(.*)$/);
+  if (m) return `${m[1]}.${m[2]}.${Number(m[3]) + 1}`;
+  const m2 = v.match(/^(\d+)\.(\d+)$/);
+  if (m2) return `${m2[1]}.${m2[2]}.1`;
+  const n = v.match(/(\d+)\s*$/);
+  if (n) return v.replace(/(\d+)\s*$/, String(Number(n[1]) + 1));
+  return `${v || "1.0.0"}.1`;
+}
+
+/**
+ * Bump the plugin version on every modification: increments the integer build
+ * counter + the semantic patch version, and re-stamps it into the main plugin
+ * file header (Version:) and readme.txt (Stable tag:) so the WordPress-visible
+ * version updates too.
+ */
+async function bumpVersion(pluginId: string): Promise<string | null> {
+  const [p] = await db.select().from(plugins).where(eq(plugins.id, pluginId)).limit(1);
+  if (!p) return null;
+  const manifest = pluginManifestSchema.safeParse(p.manifest).data ?? null;
+  const nextSemver = incrementPatch(manifest?.version || "1.0.0");
+
+  if (manifest) {
+    manifest.version = nextSemver;
+    await db.update(plugins).set({ manifest, version: p.version + 1, updatedAt: new Date() }).where(eq(plugins.id, pluginId));
+  } else {
+    await db.update(plugins).set({ version: p.version + 1, updatedAt: new Date() }).where(eq(plugins.id, pluginId));
+  }
+
+  // Re-stamp the version into the main file header + readme stable tag.
+  const [mainFile] = await db
+    .select()
+    .from(pluginFiles)
+    .where(and(eq(pluginFiles.pluginId, pluginId), eq(pluginFiles.path, `${p.slug}.php`)))
+    .limit(1);
+  if (mainFile) {
+    const updated = mainFile.content.replace(/^(\s*\*?\s*Version:\s*).*$/im, `$1${nextSemver}`);
+    if (updated !== mainFile.content) await db.update(pluginFiles).set({ content: updated }).where(eq(pluginFiles.id, mainFile.id));
+  }
+  const [readme] = await db
+    .select()
+    .from(pluginFiles)
+    .where(and(eq(pluginFiles.pluginId, pluginId), eq(pluginFiles.path, "readme.txt")))
+    .limit(1);
+  if (readme) {
+    const updated = readme.content.replace(/^(Stable tag:\s*).*$/im, `$1${nextSemver}`);
+    if (updated !== readme.content) await db.update(pluginFiles).set({ content: updated }).where(eq(pluginFiles.id, readme.id));
+  }
+  return nextSemver;
 }
 
 /** Recompute plugin status from how many manifest files now exist + their severity. */

@@ -385,7 +385,8 @@ export default function PluginWorkspace() {
             <StatusBadge status={plugin.status} />
           </div>
           <p className="mt-0.5 font-mono text-xs text-[var(--color-muted)]">
-            {plugin.slug} · v{plugin.version}
+            {plugin.slug} · v{plugin.manifest?.version ?? plugin.version}
+            <span className="ml-1 opacity-60">(build {plugin.version})</span>
           </p>
         </div>
         <div className="flex items-center gap-2">

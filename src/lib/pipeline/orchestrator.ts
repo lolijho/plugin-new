@@ -20,7 +20,7 @@ import {
   type ValidationResult,
 } from "@/lib/types";
 import { retrieveMemory, formatMemoriesForPrompt, storeMemoryDeduped } from "@/lib/memory";
-import { chatJson, type ChatMessage } from "@/lib/openrouter";
+import { chatStream, type ChatMessage } from "@/lib/openrouter";
 import { fileChatSystemPrompt } from "./prompts";
 import { runArchitect } from "./architect";
 import { runCoderForFile, runFixerForFile } from "./coder";
@@ -507,19 +507,13 @@ export async function updateFileContent(
   return { worst, status: completion?.status ?? null };
 }
 
-const fileEditJsonSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["content", "explanation"],
-  properties: { content: { type: "string" }, explanation: { type: "string" } },
-} as const;
-
-/** Edit a single file through a chat with Claude Opus, then save + re-validate it. */
+/** Edit a single file through a streamed chat with Claude Opus, then save + re-validate it. */
 export async function chatEditFile(
   plugin: DbPlugin,
   user: DbUser,
   fileId: string,
   message: string,
+  onDelta?: (text: string) => void,
 ): Promise<{ content: string; explanation: string; worst: Severity | null; status: string | null }> {
   const [row] = await db
     .select()
@@ -562,21 +556,29 @@ export async function chatEditFile(
 
   const [gen] = await db.insert(generations).values({ pluginId: plugin.id, phase: "filechat", status: "running" }).returning();
   try {
-    const { data, usage, model } = await chatJson<{ content: string; explanation: string }>({
-      model: fileChatModel(),
-      apiKey: resolveApiKey(user),
-      temperature: 0.3,
-      messages: chatMessages,
-      jsonSchema: { name: "file_edit", schema: fileEditJsonSchema as unknown as Record<string, unknown> },
-      maxTokens: 16000,
-    });
+    const { content: fullText, usage, model } = await chatStream(
+      {
+        model: fileChatModel(),
+        apiKey: resolveApiKey(user),
+        temperature: 0.3,
+        messages: chatMessages,
+        maxTokens: 16000,
+      },
+      onDelta ?? (() => {}),
+    );
     await finishGeneration(gen.id, "done", usage);
 
-    let content = data.content ?? "";
-    const fenced = content.match(/^```[a-zA-Z]*\s*\n([\s\S]*?)\n```\s*$/);
-    if (fenced) content = fenced[1];
+    // Extract the last fenced code block as the new file content. If there is no
+    // code block the model just answered a question → leave the file unchanged.
+    const blocks = [...fullText.matchAll(/```[a-zA-Z0-9]*\s*\n([\s\S]*?)```/g)];
+    const hasCode = blocks.length > 0;
+    const newContent = hasCode ? blocks[blocks.length - 1][1].replace(/\n$/, "") : row.content;
+    const explanation =
+      (hasCode ? fullText.slice(0, blocks[0].index ?? 0) : fullText).trim().slice(0, 2000) || "(file aggiornato)";
 
-    const saved = await updateFileContent(plugin, user, fileId, content);
+    const saved = hasCode
+      ? await updateFileContent(plugin, user, fileId, newContent)
+      : { worst: (row.worstSeverity as Severity | null) ?? null, status: null };
 
     await db.insert(messages).values({ pluginId: plugin.id, fileId, role: "user", phase: "filechat", content: message });
     await db.insert(messages).values({
@@ -584,13 +586,13 @@ export async function chatEditFile(
       fileId,
       role: "coder",
       phase: "filechat",
-      content: data.explanation || "(file aggiornato)",
+      content: explanation,
       model,
       promptTokens: usage.promptTokens,
       completionTokens: usage.completionTokens,
     });
 
-    return { content, explanation: data.explanation || "", worst: saved.worst, status: saved.status };
+    return { content: newContent, explanation, worst: saved.worst, status: saved.status };
   } catch (err) {
     await finishGeneration(gen.id, "failed", undefined, errorMessage(err));
     throw err;

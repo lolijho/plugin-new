@@ -78,6 +78,9 @@ export default function PluginWorkspace() {
   const [chatInput, setChatInput] = useState("");
   const [chatSending, setChatSending] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [chatStreaming, setChatStreaming] = useState("");
+  const [chatPendingUser, setChatPendingUser] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const load = useCallback(async () => {
     const res = await fetch(`/api/plugins/${id}`);
@@ -254,20 +257,61 @@ export default function PluginWorkspace() {
     setChatSending(true);
     setChatError(null);
     setChatInput("");
+    setChatPendingUser(msg);
+    setChatStreaming("");
     try {
       const res = await fetch(`/api/plugins/${id}/files/${sf.id}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: msg }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Chat fallita");
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error ?? "Chat fallita");
+      }
+      if (!res.body) throw new Error("Nessuno stream");
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part.split("\n").find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          let evt: { type: string; text?: string; message?: string };
+          try {
+            evt = JSON.parse(line.slice(5).trim());
+          } catch {
+            continue;
+          }
+          if (evt.type === "delta") setChatStreaming((s) => s + (evt.text ?? ""));
+          else if (evt.type === "error") throw new Error(evt.message ?? "errore");
+        }
+      }
       await load();
     } catch (err) {
       setChatError(err instanceof Error ? err.message : "errore");
       setChatInput(msg);
     } finally {
       setChatSending(false);
+      setChatPendingUser(null);
+      setChatStreaming("");
+    }
+  }
+
+  async function copyFile() {
+    const sf = files.find((f) => f.path === selected) ?? files[0] ?? null;
+    if (!sf) return;
+    try {
+      await navigator.clipboard.writeText(sf.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setFileMsg("Copia non riuscita");
     }
   }
 
@@ -416,7 +460,7 @@ export default function PluginWorkspace() {
             {files.map((f) => (
               <li key={f.id}>
                 <button
-                  onClick={() => { setSelected(f.path); setEditing(false); setFileMsg(null); setChatError(null); }}
+                  onClick={() => { setSelected(f.path); setEditing(false); setFileMsg(null); setChatError(null); setChatStreaming(""); setChatPendingUser(null); }}
                   className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left font-mono text-xs ${
                     selectedFile?.path === f.path ? "bg-[var(--color-panel-2)]" : "hover:bg-[var(--color-panel-2)]"
                   }`}
@@ -444,9 +488,14 @@ export default function PluginWorkspace() {
                         </button>
                       </>
                     ) : (
-                      <button className="btn-ghost px-2.5 py-1 text-xs" onClick={() => { setEditContent(selectedFile.content); setEditing(true); setFileMsg(null); }}>
-                        ✎ Modifica
-                      </button>
+                      <>
+                        <button className="btn-ghost px-2.5 py-1 text-xs" onClick={copyFile}>
+                          {copied ? "Copiato ✓" : "📋 Copia"}
+                        </button>
+                        <button className="btn-ghost px-2.5 py-1 text-xs" onClick={() => { setEditContent(selectedFile.content); setEditing(true); setFileMsg(null); }}>
+                          ✎ Modifica
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -468,8 +517,8 @@ export default function PluginWorkspace() {
                     <div className="flex items-center gap-2 px-3 pt-2 text-[10px] font-medium uppercase tracking-wide text-[var(--color-muted)]">
                       💬 Modifica con Claude Opus
                     </div>
-                    {fileChat.length > 0 && (
-                      <div className="max-h-44 space-y-2 overflow-auto px-3 py-2">
+                    {(fileChat.length > 0 || chatPendingUser || chatSending) && (
+                      <div className="max-h-60 space-y-2 overflow-auto px-3 py-2">
                         {fileChat.map((m) => (
                           <div key={m.id} className={m.role === "user" ? "text-right" : ""}>
                             <span className={`inline-block max-w-[85%] whitespace-pre-wrap rounded-lg px-2.5 py-1.5 text-xs ${m.role === "user" ? "bg-[var(--color-accent)]/15" : "bg-[var(--color-panel-2)]"}`}>
@@ -477,6 +526,21 @@ export default function PluginWorkspace() {
                             </span>
                           </div>
                         ))}
+                        {chatPendingUser && (
+                          <div className="text-right">
+                            <span className="inline-block max-w-[85%] whitespace-pre-wrap rounded-lg bg-[var(--color-accent)]/15 px-2.5 py-1.5 text-xs">
+                              {chatPendingUser}
+                            </span>
+                          </div>
+                        )}
+                        {(chatStreaming || chatSending) && (
+                          <div>
+                            <span className="inline-block max-w-full whitespace-pre-wrap rounded-lg bg-[var(--color-panel-2)] px-2.5 py-1.5 font-mono text-[11px] leading-relaxed">
+                              {chatStreaming || "…"}
+                              <span className="animate-pulse">▌</span>
+                            </span>
+                          </div>
+                        )}
                       </div>
                     )}
                     <div className="flex gap-2 p-3">

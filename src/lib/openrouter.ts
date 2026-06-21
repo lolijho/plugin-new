@@ -113,6 +113,78 @@ export async function chatJson<T>(opts: ChatOptions): Promise<{ data: T; usage: 
   return { data, usage: result.usage, model: result.model };
 }
 
+/** Streaming chat (plain text). Calls onDelta for each token; returns the full text + usage. */
+export async function chatStream(
+  opts: ChatOptions,
+  onDelta: (text: string) => void,
+): Promise<ChatResult> {
+  const apiKey = resolveKey(opts.apiKey);
+  const body: Record<string, unknown> = {
+    model: opts.model,
+    messages: opts.messages,
+    temperature: opts.temperature ?? 0.4,
+    stream: true,
+    usage: { include: true },
+  };
+  if (opts.maxTokens) body.max_tokens = opts.maxTokens;
+
+  const res = await fetch(`${BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: headers(apiKey),
+    body: JSON.stringify(body),
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`OpenRouter error ${res.status} for model "${opts.model}": ${text.slice(0, 600)}`);
+  }
+  if (!res.body) throw new Error("OpenRouter returned no stream body.");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let content = "";
+  let model = opts.model;
+  const usage: Usage = { promptTokens: 0, completionTokens: 0, costUsd: 0 };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      let j: {
+        choices?: { delta?: { content?: string } }[];
+        usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
+        model?: string;
+      };
+      try {
+        j = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      const delta = j.choices?.[0]?.delta?.content;
+      if (delta) {
+        content += delta;
+        onDelta(delta);
+      }
+      if (j.usage) {
+        usage.promptTokens = j.usage.prompt_tokens ?? 0;
+        usage.completionTokens = j.usage.completion_tokens ?? 0;
+        usage.costUsd = j.usage.cost ?? 0;
+      }
+      if (j.model) model = j.model;
+    }
+  }
+
+  return { content, usage, model };
+}
+
 export function parseJsonLoose<T>(raw: string): T {
   let text = raw.trim();
   // Strip ```json fences if a model added them despite structured output.

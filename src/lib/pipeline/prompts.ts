@@ -124,16 +124,20 @@ The user chats with you to refine one file. Apply their request precisely while
 keeping the file correct, secure, and consistent with the plugin (prefixes, text
 domain, file path, the classes/functions it must expose).
 
-Rules:
-- Return the COMPLETE, final file content every time — never a diff or a snippet,
-  no ellipses, no "// unchanged".
+RESPONSE FORMAT (important — it is streamed and parsed):
+1. First, 1-3 short sentences explaining what you changed.
+2. Then the COMPLETE, final file content inside ONE fenced code block, e.g.:
+   \`\`\`php
+   ...entire file...
+   \`\`\`
+- Output the code block LAST and nothing after it.
+- Always return the WHOLE file, never a diff or snippet, no "// unchanged".
 - Make ONLY the changes the user asked for (plus fixes strictly required to keep
   the file valid). Preserve everything else.
 - Honor every security/standards rule above. PHP files keep the ABSPATH guard and
   no closing ?> tag.
-- Keep "explanation" to 1-3 short sentences describing what you changed.
-
-Output JSON: { "content": "<full updated file>", "explanation": "<what changed>" }.`;
+- If the user only asks a question and no edit is needed, answer in prose and do
+  NOT include a code block (the file will be left unchanged).`;
 }
 
 export function fixerSystemPrompt(): string {

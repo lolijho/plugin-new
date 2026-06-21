@@ -12,6 +12,8 @@ import {
 } from "@/db/schema";
 import {
   pluginManifestSchema,
+  reviewFindingSchema,
+  reviewResultJsonSchema,
   severityRank,
   type GeneratedFile,
   type PluginManifest,
@@ -20,8 +22,9 @@ import {
   type ValidationResult,
 } from "@/lib/types";
 import { retrieveMemory, formatMemoriesForPrompt, storeMemoryDeduped } from "@/lib/memory";
-import { chatStream, type ChatMessage } from "@/lib/openrouter";
-import { fileChatSystemPrompt } from "./prompts";
+import { z } from "zod";
+import { chatJson, chatStream, type ChatMessage } from "@/lib/openrouter";
+import { fileChatSystemPrompt, diagnoseSystemPrompt } from "./prompts";
 import { runArchitect } from "./architect";
 import { runCoderForFile, runFixerForFile } from "./coder";
 import { runReviewerForFile } from "./reviewer";
@@ -593,6 +596,110 @@ export async function chatEditFile(
     });
 
     return { content: newContent, explanation, worst: saved.worst, status: saved.status };
+  } catch (err) {
+    await finishGeneration(gen.id, "failed", undefined, errorMessage(err));
+    throw err;
+  }
+}
+
+/** Analyze the WHOLE plugin (all files together, + an optional WordPress error
+ *  message) with Claude Opus to find the root cause of a critical/fatal error. */
+export async function diagnosePlugin(
+  plugin: DbPlugin,
+  user: DbUser,
+  errorText?: string,
+): Promise<{ summary: string; findingsCount: number; status: string | null }> {
+  const manifest = pluginManifestSchema.safeParse(plugin.manifest).data ?? null;
+  const fileRows = await db
+    .select()
+    .from(pluginFiles)
+    .where(eq(pluginFiles.pluginId, plugin.id))
+    .orderBy(asc(pluginFiles.path));
+  if (fileRows.length === 0) throw new Error("Nessun file generato da analizzare.");
+
+  // Deterministic whole-plugin check (e.g. main file missing) — free.
+  const validations = await validateFiles(
+    fileRows.map((f) => ({ path: f.path, content: f.content, language: f.language })),
+    manifest,
+    { wholePlugin: true },
+  );
+
+  const filesBlock = fileRows
+    .map((f) => {
+      const body = f.content.length > 9000 ? f.content.slice(0, 9000) + "\n/* …troncato… */" : f.content;
+      const numbered = body.split("\n").map((l, i) => `${i + 1}  ${l}`).join("\n");
+      return `### ${f.path}\n\`\`\`${f.language}\n${numbered}\n\`\`\``;
+    })
+    .join("\n\n");
+
+  const userPrompt = [
+    manifest
+      ? `Plugin: ${manifest.name} (slug ${manifest.slug}, prefix ${manifest.prefix}, requires PHP ${manifest.requiresPhp}, WP ${manifest.requiresWp}).`
+      : "",
+    errorText ? `# ERROR REPORTED BY THE USER (from WordPress)\n${errorText.slice(0, 2500)}` : "",
+    "# ALL PLUGIN FILES (with line numbers)",
+    filesBlock,
+    "",
+    "Diagnose the root cause of the critical/fatal error. Return JSON { summary, findings }.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const [gen] = await db.insert(generations).values({ pluginId: plugin.id, phase: "diagnose", status: "running" }).returning();
+  try {
+    const { data, usage } = await chatJson<unknown>({
+      model: resolveModel("reviewer", { user, plugin }),
+      apiKey: resolveApiKey(user),
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: diagnoseSystemPrompt() },
+        { role: "user", content: userPrompt },
+      ],
+      jsonSchema: { name: "diagnosis", schema: reviewResultJsonSchema as unknown as Record<string, unknown> },
+      maxTokens: 6000,
+    });
+    await finishGeneration(gen.id, "done", usage);
+
+    const parsed = z
+      .object({ summary: z.string().default(""), findings: z.array(reviewFindingSchema).default([]) })
+      .parse(data);
+
+    // Replace previous analyzer findings, then insert the new diagnosis.
+    await db.delete(reviewFindings).where(and(eq(reviewFindings.pluginId, plugin.id), eq(reviewFindings.source, "analyzer")));
+    for (const f of parsed.findings) {
+      const fileRow = fileRows.find((r) => r.path === f.filePath);
+      await db.insert(reviewFindings).values({
+        pluginId: plugin.id,
+        fileId: fileRow?.id ?? null,
+        filePath: f.filePath || "",
+        severity: f.severity,
+        category: f.category,
+        line: f.line ?? null,
+        message: f.message,
+        suggestion: f.suggestion || null,
+        source: "analyzer",
+      });
+    }
+    // Whole-plugin deterministic catch (main file missing).
+    for (const v of validations.filter((x) => !x.passed && x.check === "main-file")) {
+      await db.insert(reviewFindings).values({
+        pluginId: plugin.id,
+        filePath: v.filePath,
+        severity: v.severity,
+        category: "fatal",
+        message: v.message,
+        source: "analyzer",
+      });
+    }
+
+    // Refresh each file's worst severity + the plugin status.
+    for (const fr of fileRows) {
+      const sevs = await db.select({ severity: reviewFindings.severity }).from(reviewFindings).where(eq(reviewFindings.fileId, fr.id));
+      await db.update(pluginFiles).set({ worstSeverity: maxSeverity(sevs.map((s) => s.severity)) }).where(eq(pluginFiles.id, fr.id));
+    }
+    const completion = manifest ? await recomputeStatus(plugin.id, manifest) : null;
+
+    return { summary: parsed.summary, findingsCount: parsed.findings.length, status: completion?.status ?? null };
   } catch (err) {
     await finishGeneration(gen.id, "failed", undefined, errorMessage(err));
     throw err;

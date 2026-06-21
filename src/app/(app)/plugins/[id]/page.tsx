@@ -81,6 +81,11 @@ export default function PluginWorkspace() {
   const [chatStreaming, setChatStreaming] = useState("");
   const [chatPendingUser, setChatPendingUser] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  // Whole-plugin diagnosis
+  const [diagInput, setDiagInput] = useState("");
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [diagnosis, setDiagnosis] = useState<string | null>(null);
+  const [diagError, setDiagError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const res = await fetch(`/api/plugins/${id}`);
@@ -312,6 +317,27 @@ export default function PluginWorkspace() {
       setTimeout(() => setCopied(false), 1500);
     } catch {
       setFileMsg("Copia non riuscita");
+    }
+  }
+
+  // Tool: send the whole plugin (+ optional WP error) to Opus to find the root cause.
+  async function diagnose() {
+    setDiagnosing(true);
+    setDiagError(null);
+    try {
+      const res = await fetch(`/api/plugins/${id}/diagnose`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ errorText: diagInput.trim() || undefined }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Analisi fallita");
+      setDiagnosis(data.summary || "Nessun problema evidente trovato.");
+      await load();
+    } catch (err) {
+      setDiagError(err instanceof Error ? err.message : "errore");
+    } finally {
+      setDiagnosing(false);
     }
   }
 
@@ -629,7 +655,33 @@ export default function PluginWorkspace() {
 
       {/* ISSUES TAB */}
       {tab === "issues" && (
-        <div className="space-y-2">
+        <div className="space-y-3">
+          {/* Whole-plugin diagnosis tool */}
+          <div className="card space-y-3 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm font-semibold">🔎 Analizza l&apos;intero plugin</h3>
+              <button className="btn-primary px-3 py-1.5 text-xs" disabled={diagnosing || !hasFiles} onClick={diagnose}>
+                {diagnosing ? "Analisi in corso…" : "Trova l'errore"}
+              </button>
+            </div>
+            <p className="text-xs text-[var(--color-muted)]">
+              Manda tutti i file a Claude Opus per trovare la causa di un errore critico, anche tra file diversi (require sbagliati, funzioni/classi non definite, hook di attivazione…). Incolla l&apos;errore esatto che vedi in WordPress per un&apos;analisi mirata.
+            </p>
+            <textarea
+              className="input min-h-[60px] text-xs"
+              placeholder="(opzionale) Incolla qui l'errore di WordPress, es. “Fatal error: Uncaught Error: Call to undefined function myplugin_init() in …”"
+              value={diagInput}
+              onChange={(e) => setDiagInput(e.target.value)}
+            />
+            {diagError && <div className="text-xs text-red-300">{diagError}</div>}
+            {diagnosis && (
+              <div className="whitespace-pre-wrap rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3 text-sm">
+                <div className="mb-1 text-xs font-semibold uppercase text-[var(--color-muted)]">Diagnosi</div>
+                {diagnosis}
+              </div>
+            )}
+          </div>
+
           {findings.length === 0 ? (
             <div className="card p-6 text-sm text-[var(--color-muted)]">
               {hasFiles ? "No issues found 🎉" : "Generate the plugin to run reviews."}

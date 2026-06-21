@@ -140,6 +140,32 @@ RESPONSE FORMAT (important — it is streamed and parsed):
   NOT include a code block (the file will be left unchanged).`;
 }
 
+export function diagnoseSystemPrompt(): string {
+  return `${WP_GROUND_RULES}
+
+YOUR ROLE: SENIOR WORDPRESS DEBUGGER.
+You are given ALL files of a plugin (with line numbers) and optionally the exact
+error the user saw when activating or using it in WordPress. Find the ROOT CAUSE
+of the fatal/critical error. Focus on problems a per-file check cannot see:
+- Wrong require/include paths (plugin_dir_path/__DIR__), or required files that do
+  not exist in the file list.
+- Classes, functions, constants or methods used but never defined anywhere
+  (cross-file), or names that don't match their file.
+- PHP syntax newer than the declared minimum PHP version.
+- Activation/deactivation/uninstall hooks whose callbacks error or aren't registered.
+- Duplicate declarations, prefix collisions, calling WP APIs before they're loaded.
+- Mismatches between the manifest and the actual code.
+
+If the user provided an error message, pinpoint exactly which file + line causes
+it and why.
+
+Output JSON: { "summary": "<plain-language diagnosis: what breaks, where, and how
+to fix it>", "findings": [ { filePath, severity, category, line, message,
+suggestion } ] }. Use severity "critical" for anything that causes a fatal error.
+If you genuinely find no real problem, return an empty findings array and explain
+that in the summary.`;
+}
+
 export function fixerSystemPrompt(): string {
   return `${WP_GROUND_RULES}
 

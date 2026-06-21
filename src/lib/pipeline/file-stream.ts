@@ -1,5 +1,6 @@
 import "server-only";
 import type { RunEvent } from "./orchestrator";
+import { PHASE } from "./phases";
 
 /**
  * Streams a single-file action (create / analyze / fix) as Server-Sent Events,
@@ -10,14 +11,6 @@ type StreamEvent =
   | { type: "progress"; percent: number; label: string; path?: string }
   | { type: "result"; result: unknown }
   | { type: "error"; message: string };
-
-const PHASE: Partial<Record<RunEvent["type"], { percent: number; label: string }>> = {
-  "file:start": { percent: 8, label: "Preparazione…" },
-  "file:coded": { percent: 55, label: "Codice scritto · revisione…" },
-  "file:reviewed": { percent: 80, label: "Revisione…" },
-  "file:fixed": { percent: 90, label: "Correzione · riverifica…" },
-  "file:done": { percent: 98, label: "Salvataggio…" },
-};
 
 export function streamFileAction<T>(run: (emit: (e: RunEvent) => void) => Promise<T>): Response {
   const encoder = new TextEncoder();

@@ -50,6 +50,14 @@ export const severity = pgEnum("severity", [
   "info",
 ]);
 
+export const jobStatus = pgEnum("job_status", [
+  "queued",
+  "running",
+  "done",
+  "failed",
+  "canceled",
+]);
+
 // ── Users ───────────────────────────────────────────────────────────────────
 export const users = pgTable("users", {
   id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
@@ -97,6 +105,8 @@ export const plugins = pgTable(
       reviewer?: string;
     }>(),
     version: integer("version").notNull().default(1),
+    // When true the background worker skips this plugin's queued jobs.
+    queuePaused: boolean("queue_paused").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -225,6 +235,36 @@ export const memoryEntries = pgTable(
       .using("hnsw", t.embedding.op("vector_cosine_ops")),
   ],
 );
+
+// ── Background job queue (server-side, survives client disconnects) ─────────
+export const jobs = pgTable(
+  "jobs",
+  {
+    id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+    pluginId: text("plugin_id")
+      .notNull()
+      .references(() => plugins.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    path: text("path").notNull(),
+    action: text("action").notNull().default("generate-file"), // generate-file | analyze-file | fix-file
+    status: jobStatus("status").notNull().default("queued"),
+    progress: integer("progress").notNull().default(0),
+    label: text("label"),
+    error: text("error"),
+    attempts: integer("attempts").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("jobs_status_idx").on(t.status, t.createdAt),
+    index("jobs_plugin_idx").on(t.pluginId),
+  ],
+);
+
+export type DbJob = typeof jobs.$inferSelect;
 
 export type DbUser = typeof users.$inferSelect;
 export type DbPlugin = typeof plugins.$inferSelect;

@@ -1,18 +1,25 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PluginManifest } from "@/lib/types";
 import SeverityBadge from "@/components/SeverityBadge";
 
 type CreatedFile = { path: string; worstSeverity: string | null };
 type Action = "generate-file" | "analyze-file" | "fix-file";
-type QueueItem = { path: string; action: Action };
+type Job = {
+  id: string;
+  path: string;
+  action: Action;
+  status: "queued" | "running" | "failed";
+  progress: number;
+  label: string | null;
+  error: string | null;
+};
 
 function dirOf(p: string): string {
   const i = p.lastIndexOf("/");
   return i < 0 ? "(root)" : p.slice(0, i);
 }
-const keyOf = (it: QueueItem) => `${it.path}|${it.action}`;
 const ACTION_SHORT: Record<Action, string> = {
   "generate-file": "crea",
   "analyze-file": "analizza",
@@ -30,47 +37,20 @@ export default function BuildStructure({
   createdFiles: CreatedFile[];
   onChanged: () => Promise<void> | void;
 }) {
-  // The queue is held in a ref (source of truth for the async worker) and
-  // mirrored to state for rendering.
-  const queueRef = useRef<QueueItem[]>([]);
-  const [queue, setQueue] = useState<QueueItem[]>([]);
-  const processingRef = useRef(false);
-  const pausedRef = useRef(false);
+  const [serverJobs, setServerJobs] = useState<Job[]>([]);
   const [paused, setPaused] = useState(false);
-  const [current, setCurrent] = useState<QueueItem | null>(null);
-  const [progress, setProgress] = useState<{ percent: number; label: string } | null>(null);
+  const [display, setDisplay] = useState(0); // smoothed % for the running job
   const [error, setError] = useState<string | null>(null);
 
-  // Smoothly creep the bar between real phase milestones so it always moves.
-  const creepTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-  const creepCapRef = useRef(20);
-  const startCreep = () => {
-    stopCreep();
-    creepCapRef.current = 18;
-    creepTimer.current = setInterval(() => {
-      setProgress((p) => (p && p.percent < creepCapRef.current ? { ...p, percent: Math.min(p.percent + 1, creepCapRef.current) } : p));
-    }, 600);
-  };
-  const stopCreep = () => {
-    if (creepTimer.current) {
-      clearInterval(creepTimer.current);
-      creepTimer.current = null;
-    }
-  };
-
-  const sync = () => setQueue([...queueRef.current]);
+  const runningRef = useRef<{ id: string; floor: number } | null>(null);
+  const prevRunningId = useRef<string | null>(null);
+  const prevActive = useRef(0);
 
   const createdMap = useMemo(() => {
     const m = new Map<string, CreatedFile>();
     for (const f of createdFiles) m.set(f.path, f);
     return m;
   }, [createdFiles]);
-
-  const queuedKeys = useMemo(() => {
-    const s = new Set(queue.map(keyOf));
-    if (current) s.add(keyOf(current));
-    return s;
-  }, [queue, current]);
 
   const groups = useMemo(() => {
     const map = new Map<string, PluginManifest["files"]>();
@@ -84,115 +64,104 @@ export default function BuildStructure({
     );
   }, [manifest.files]);
 
+  const running = serverJobs.find((j) => j.status === "running") ?? null;
+  const queued = serverJobs.filter((j) => j.status === "queued");
+  const failed = serverJobs.filter((j) => j.status === "failed");
+
+  const pendingKeys = useMemo(() => {
+    const s = new Set<string>();
+    for (const j of serverJobs) if (j.status !== "failed") s.add(`${j.path}|${j.action}`);
+    return s;
+  }, [serverJobs]);
+
   const total = manifest.files.length;
   const createdCount = manifest.files.filter((f) => createdMap.has(f.path)).length;
   const pendingPaths = manifest.files.filter((f) => !createdMap.has(f.path)).map((f) => f.path);
 
-  // Runs one action, streaming pipeline phases → percentage via SSE.
-  async function streamAction(item: QueueItem, onProgress: (percent: number, label: string) => void): Promise<void> {
-    const res = await fetch(`/api/plugins/${pluginId}/${item.action}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: item.path }),
-    });
-    if (!res.ok) {
-      const d = await res.json().catch(() => ({}));
-      throw new Error(d.error ?? "Operazione fallita");
-    }
-    if (!res.body) throw new Error("Nessuno stream");
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const parts = buf.split("\n\n");
-      buf = parts.pop() ?? "";
-      for (const part of parts) {
-        const line = part.split("\n").find((l) => l.startsWith("data:"));
-        if (!line) continue;
-        let evt: { type: string; percent?: number; label?: string; message?: string };
-        try {
-          evt = JSON.parse(line.slice(5).trim());
-        } catch {
-          continue;
-        }
-        if (evt.type === "progress") onProgress(evt.percent ?? 0, evt.label ?? "");
-        else if (evt.type === "error") throw new Error(evt.message ?? "Errore");
-        else if (evt.type === "result") onProgress(100, "Completato");
-      }
-    }
-  }
+  const poll = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/plugins/${pluginId}/queue`, { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { paused: boolean; jobs: Job[] };
+      setServerJobs(data.jobs);
+      setPaused(data.paused);
 
-  async function runWorker() {
-    if (processingRef.current || pausedRef.current) return;
-    processingRef.current = true;
+      const run = data.jobs.find((j) => j.status === "running") ?? null;
+      // Smooth progress bookkeeping.
+      if (run) {
+        if (runningRef.current?.id !== run.id) {
+          runningRef.current = { id: run.id, floor: run.progress };
+          setDisplay(run.progress);
+        } else {
+          runningRef.current.floor = run.progress;
+          setDisplay((d) => Math.max(d, run.progress));
+        }
+      } else {
+        runningRef.current = null;
+        setDisplay(0);
+      }
+
+      // Refresh the file tree when a file finishes (running job changes / queue shrinks).
+      const activeCount = data.jobs.filter((j) => j.status !== "failed").length;
+      const runId = run?.id ?? null;
+      if (runId !== prevRunningId.current || activeCount < prevActive.current) {
+        await onChanged();
+      }
+      prevRunningId.current = runId;
+      prevActive.current = activeCount;
+    } catch {
+      /* ignore transient poll errors */
+    }
+  }, [pluginId, onChanged]);
+
+  useEffect(() => {
+    poll();
+    const t = setInterval(poll, 2000);
+    return () => clearInterval(t);
+  }, [poll]);
+
+  // Creep the running bar between server milestones so it always moves.
+  useEffect(() => {
+    const t = setInterval(() => {
+      const r = runningRef.current;
+      if (!r) return;
+      const cap = Math.min(r.floor + 12, 96);
+      setDisplay((d) => (d < cap ? Math.min(d + 1, cap) : d));
+    }, 700);
+    return () => clearInterval(t);
+  }, []);
+
+  async function enqueue(items: { path: string; action: Action }[]) {
+    const toAdd = items.filter((it) => !pendingKeys.has(`${it.path}|${it.action}`));
+    if (toAdd.length === 0) return;
     setError(null);
     try {
-      while (!pausedRef.current && queueRef.current.length > 0) {
-        const item = queueRef.current[0];
-        setCurrent(item);
-        setProgress({ percent: 4, label: `${ACTION_SHORT[item.action]}…` });
-        startCreep();
-        try {
-          await streamAction(item, (percent, label) => {
-            creepCapRef.current = Math.min(percent + 14, 96);
-            setProgress((p) => ({ percent: Math.max(p?.percent ?? 0, percent), label: label || p?.label || "" }));
-          });
-          stopCreep();
-          queueRef.current.shift();
-          sync();
-          setCurrent(null);
-          setProgress(null);
-          await onChanged();
-        } catch (err) {
-          // Pause the queue on error so the user can intervene; keep the item.
-          stopCreep();
-          setCurrent(null);
-          setProgress(null);
-          setError(`${item.path} (${ACTION_SHORT[item.action]}): ${err instanceof Error ? err.message : "errore"}`);
-          pausedRef.current = true;
-          setPaused(true);
-          break;
-        }
+      const res = await fetch(`/api/plugins/${pluginId}/queue`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: toAdd }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error ?? "Impossibile accodare");
       }
-    } finally {
-      stopCreep();
-      processingRef.current = false;
+      await poll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "errore");
     }
   }
 
-  function enqueue(items: QueueItem[]) {
-    const toAdd = items.filter((it) => !queuedKeys.has(keyOf(it)));
-    if (toAdd.length === 0) return;
-    queueRef.current.push(...toAdd);
-    sync();
-    // If not paused, the worker starts/continues. If the user paused (or an
-    // error paused the queue), added items wait until they press Resume.
-    runWorker();
+  async function control(action: string, jobId?: string) {
+    await fetch(`/api/plugins/${pluginId}/queue/control`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, jobId }),
+    });
+    await poll();
   }
 
-  function pause() {
-    pausedRef.current = true;
-    setPaused(true);
-  }
-  function resume() {
-    pausedRef.current = false;
-    setPaused(false);
-    runWorker();
-  }
-  function clearQueue() {
-    queueRef.current = [];
-    sync();
-  }
-  function removeAt(i: number) {
-    queueRef.current.splice(i, 1);
-    sync();
-  }
-
-  const busy = current !== null;
-  const waiting = queue.length;
+  const isCurrent = (path: string) => running?.path === path;
+  const isPending = (path: string, action: Action) => pendingKeys.has(`${path}|${action}`);
 
   return (
     <div className="space-y-4">
@@ -204,14 +173,12 @@ export default function BuildStructure({
             <div className="h-full bg-[var(--color-accent)] transition-all" style={{ width: `${total ? (createdCount / total) * 100 : 0}%` }} />
           </div>
           <p className="mt-2 text-xs text-[var(--color-muted)]">
-            Aggiungi file e cartelle alla coda (anche mentre lavora). Vengono creati uno alla volta, così il sistema non si sovraccarica e il lavoro resta salvato.
+            La coda gira <b>sul server</b>: puoi chiudere l’app o spegnere il computer, la creazione continua. Riapri quando vuoi per vedere l’avanzamento.
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <button className="btn-ghost" disabled={pendingPaths.length === 0} onClick={() => enqueue(pendingPaths.map((p) => ({ path: p, action: "generate-file" as const })))}>
-            ＋ Coda tutti i rimanenti ({pendingPaths.length})
-          </button>
-        </div>
+        <button className="btn-ghost" disabled={pendingPaths.length === 0} onClick={() => enqueue(pendingPaths.map((p) => ({ path: p, action: "generate-file" as const })))}>
+          ＋ Coda tutti i rimanenti ({pendingPaths.length})
+        </button>
       </div>
 
       {/* Queue panel */}
@@ -220,43 +187,55 @@ export default function BuildStructure({
           <span className="text-sm font-semibold">
             Coda{" "}
             <span className="text-[var(--color-muted)]">
-              · {busy ? "in lavorazione" : paused ? "in pausa" : waiting > 0 ? "in attesa" : "vuota"}
+              · {running ? "in lavorazione" : paused ? "in pausa" : queued.length > 0 ? "in attesa" : "vuota"}
             </span>
           </span>
           <div className="flex items-center gap-2">
             {paused ? (
-              <button className="btn-ghost px-2.5 py-1 text-xs" disabled={waiting === 0} onClick={resume}>▶ Riprendi</button>
+              <button className="btn-ghost px-2.5 py-1 text-xs" onClick={() => control("resume")}>▶ Riprendi</button>
             ) : (
-              <button className="btn-ghost px-2.5 py-1 text-xs" disabled={!busy && waiting === 0} onClick={pause}>⏸ Pausa</button>
+              <button className="btn-ghost px-2.5 py-1 text-xs" disabled={!running && queued.length === 0} onClick={() => control("pause")}>⏸ Pausa</button>
             )}
-            <button className="btn-ghost px-2.5 py-1 text-xs" disabled={waiting === 0} onClick={clearQueue}>Svuota</button>
+            <button className="btn-ghost px-2.5 py-1 text-xs" disabled={queued.length === 0 && failed.length === 0} onClick={() => control("clear")}>Svuota</button>
           </div>
         </div>
 
-        {current && (
+        {running && (
           <div className="mb-2 rounded-lg bg-[var(--color-panel-2)] px-3 py-2">
             <div className="mb-1.5 flex items-center gap-2 text-sm">
               <span className="animate-pulse">⏳</span>
-              <span className="font-mono text-xs">{current.path}</span>
-              <span className="text-xs text-[var(--color-accent)]">{progress?.label ?? `${ACTION_SHORT[current.action]}…`}</span>
-              <span className="ml-auto text-sm font-semibold tabular-nums">{progress?.percent ?? 0}%</span>
+              <span className="font-mono text-xs">{running.path}</span>
+              <span className="text-xs text-[var(--color-accent)]">{running.label ?? `${ACTION_SHORT[running.action]}…`}</span>
+              <span className="ml-auto text-sm font-semibold tabular-nums">{display}%</span>
             </div>
             <div className="h-2 w-full overflow-hidden rounded bg-[var(--color-bg)]">
-              <div className="h-full rounded bg-[var(--color-accent)] transition-all duration-500" style={{ width: `${progress?.percent ?? 0}%` }} />
+              <div className="h-full rounded bg-[var(--color-accent)] transition-all duration-500" style={{ width: `${display}%` }} />
             </div>
           </div>
         )}
 
-        {waiting === 0 && !current ? (
-          <p className="text-xs text-[var(--color-muted)]">Nessun elemento in coda. Usa “Crea”, “Coda cartella” o i pulsanti per file.</p>
+        {queued.length === 0 && !running && failed.length === 0 ? (
+          <p className="text-xs text-[var(--color-muted)]">Nessun elemento in coda.</p>
         ) : (
           <ul className="space-y-1">
-            {queue.map((it, i) => (
-              <li key={`${keyOf(it)}-${i}`} className="flex items-center gap-2 text-xs">
+            {queued.map((j, i) => (
+              <li key={j.id} className="flex items-center gap-2 text-xs">
                 <span className="w-5 text-center text-[var(--color-muted)]">{i + 1}</span>
-                <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 uppercase text-[10px] text-[var(--color-muted)]">{ACTION_SHORT[it.action]}</span>
-                <span className="font-mono">{it.path}</span>
-                <button className="ml-auto text-red-300 hover:underline" onClick={() => removeAt(i)}>rimuovi</button>
+                <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 text-[10px] uppercase text-[var(--color-muted)]">{ACTION_SHORT[j.action]}</span>
+                <span className="font-mono">{j.path}</span>
+                <button className="ml-auto text-red-300 hover:underline" onClick={() => control("remove", j.id)}>rimuovi</button>
+              </li>
+            ))}
+            {failed.map((j) => (
+              <li key={j.id} className="flex items-center gap-2 text-xs text-red-300">
+                <span className="w-5 text-center">⚠</span>
+                <span className="rounded bg-red-500/10 px-1.5 py-0.5 text-[10px] uppercase">{ACTION_SHORT[j.action]}</span>
+                <span className="font-mono">{j.path}</span>
+                <span className="truncate text-[var(--color-muted)]">{j.error}</span>
+                <span className="ml-auto flex gap-2">
+                  <button className="hover:underline" onClick={() => control("retry", j.id)}>riprova</button>
+                  <button className="text-red-300 hover:underline" onClick={() => control("remove", j.id)}>rimuovi</button>
+                </span>
               </li>
             ))}
           </ul>
@@ -295,13 +274,12 @@ export default function BuildStructure({
             <ul className="divide-y divide-[var(--color-border)]">
               {files.map((f) => {
                 const created = createdMap.get(f.path);
-                const isCurrent = current?.path === f.path;
+                const current = isCurrent(f.path);
                 const base = f.path.slice(f.path.lastIndexOf("/") + 1);
                 const hasIssues = created?.worstSeverity && created.worstSeverity !== "info";
-                const isQueued = (a: Action) => queuedKeys.has(`${f.path}|${a}`);
                 return (
                   <li key={f.path} className="flex items-center gap-3 px-4 py-2.5">
-                    <span className="w-5 text-center">{isCurrent ? "⏳" : created ? "✅" : "⚪"}</span>
+                    <span className="w-5 text-center">{current ? "⏳" : created ? "✅" : "⚪"}</span>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <span className="font-mono text-sm">{base}</span>
@@ -310,24 +288,24 @@ export default function BuildStructure({
                       <p className="truncate text-xs text-[var(--color-muted)]">{f.purpose}</p>
                     </div>
                     <div className="flex shrink-0 items-center gap-1.5">
-                      {isCurrent ? (
-                        <span className="text-xs font-semibold tabular-nums text-[var(--color-accent)]">{progress?.percent ?? 0}%</span>
+                      {current ? (
+                        <span className="text-xs font-semibold tabular-nums text-[var(--color-accent)]">{display}%</span>
                       ) : !created ? (
-                        <button className="btn-ghost px-2.5 py-1 text-xs" disabled={isQueued("generate-file")} onClick={() => enqueue([{ path: f.path, action: "generate-file" }])}>
-                          {isQueued("generate-file") ? "in coda" : "Crea"}
+                        <button className="btn-ghost px-2.5 py-1 text-xs" disabled={isPending(f.path, "generate-file")} onClick={() => enqueue([{ path: f.path, action: "generate-file" }])}>
+                          {isPending(f.path, "generate-file") ? "in coda" : "Crea"}
                         </button>
                       ) : (
                         <>
-                          <button className="btn-ghost px-2.5 py-1 text-xs" disabled={isQueued("analyze-file")} onClick={() => enqueue([{ path: f.path, action: "analyze-file" }])}>
-                            {isQueued("analyze-file") ? "in coda" : "Analizza"}
+                          <button className="btn-ghost px-2.5 py-1 text-xs" disabled={isPending(f.path, "analyze-file")} onClick={() => enqueue([{ path: f.path, action: "analyze-file" }])}>
+                            {isPending(f.path, "analyze-file") ? "in coda" : "Analizza"}
                           </button>
                           {hasIssues && (
-                            <button className="btn-ghost px-2.5 py-1 text-xs text-amber-300" disabled={isQueued("fix-file")} onClick={() => enqueue([{ path: f.path, action: "fix-file" }])}>
-                              {isQueued("fix-file") ? "in coda" : "Correggi"}
+                            <button className="btn-ghost px-2.5 py-1 text-xs text-amber-300" disabled={isPending(f.path, "fix-file")} onClick={() => enqueue([{ path: f.path, action: "fix-file" }])}>
+                              {isPending(f.path, "fix-file") ? "in coda" : "Correggi"}
                             </button>
                           )}
-                          <button className="btn-ghost px-2.5 py-1 text-xs" disabled={isQueued("generate-file")} onClick={() => enqueue([{ path: f.path, action: "generate-file" }])}>
-                            {isQueued("generate-file") ? "in coda" : "Rigenera"}
+                          <button className="btn-ghost px-2.5 py-1 text-xs" disabled={isPending(f.path, "generate-file")} onClick={() => enqueue([{ path: f.path, action: "generate-file" }])}>
+                            {isPending(f.path, "generate-file") ? "in coda" : "Rigenera"}
                           </button>
                         </>
                       )}

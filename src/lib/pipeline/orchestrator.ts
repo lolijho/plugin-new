@@ -1,5 +1,5 @@
 import "server-only";
-import { and, eq, sql } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   plugins,
@@ -20,6 +20,8 @@ import {
   type ValidationResult,
 } from "@/lib/types";
 import { retrieveMemory, formatMemoriesForPrompt, storeMemoryDeduped } from "@/lib/memory";
+import { chatJson, type ChatMessage } from "@/lib/openrouter";
+import { fileChatSystemPrompt } from "./prompts";
 import { runArchitect } from "./architect";
 import { runCoderForFile, runFixerForFile } from "./coder";
 import { runReviewerForFile } from "./reviewer";
@@ -29,6 +31,7 @@ import {
   resolveApiKey,
   resolveTemperature,
   autofixIterations,
+  fileChatModel,
 } from "./resolve";
 
 type Usage = { promptTokens: number; completionTokens: number; costUsd: number };
@@ -502,6 +505,96 @@ export async function updateFileContent(
 
   const completion = manifest ? await recomputeStatus(plugin.id, manifest) : null;
   return { worst, status: completion?.status ?? null };
+}
+
+const fileEditJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["content", "explanation"],
+  properties: { content: { type: "string" }, explanation: { type: "string" } },
+} as const;
+
+/** Edit a single file through a chat with Claude Opus, then save + re-validate it. */
+export async function chatEditFile(
+  plugin: DbPlugin,
+  user: DbUser,
+  fileId: string,
+  message: string,
+): Promise<{ content: string; explanation: string; worst: Severity | null; status: string | null }> {
+  const [row] = await db
+    .select()
+    .from(pluginFiles)
+    .where(and(eq(pluginFiles.id, fileId), eq(pluginFiles.pluginId, plugin.id)))
+    .limit(1);
+  if (!row) throw new Error("File not found");
+  const manifest = pluginManifestSchema.safeParse(plugin.manifest).data ?? null;
+
+  const history = await db
+    .select({ role: messages.role, content: messages.content })
+    .from(messages)
+    .where(and(eq(messages.fileId, fileId), eq(messages.phase, "filechat")))
+    .orderBy(asc(messages.createdAt));
+
+  const chatMessages: ChatMessage[] = [{ role: "system", content: fileChatSystemPrompt() }];
+  if (manifest) {
+    chatMessages.push({
+      role: "system",
+      content: `Plugin: ${manifest.name} (slug ${manifest.slug}, prefix ${manifest.prefix}, text domain ${manifest.textDomain}). File: ${row.path} — ${row.purpose}.`,
+    });
+  }
+  for (const h of history.slice(-10)) {
+    chatMessages.push({ role: h.role === "user" ? "user" : "assistant", content: h.content });
+  }
+  chatMessages.push({
+    role: "user",
+    content: [
+      `# CURRENT FILE (${row.path})`,
+      "```" + row.language,
+      row.content,
+      "```",
+      "",
+      "# INSTRUCTION",
+      message,
+      "",
+      'Return JSON { "content": <full updated file>, "explanation": <what changed> }.',
+    ].join("\n"),
+  });
+
+  const [gen] = await db.insert(generations).values({ pluginId: plugin.id, phase: "filechat", status: "running" }).returning();
+  try {
+    const { data, usage, model } = await chatJson<{ content: string; explanation: string }>({
+      model: fileChatModel(),
+      apiKey: resolveApiKey(user),
+      temperature: 0.3,
+      messages: chatMessages,
+      jsonSchema: { name: "file_edit", schema: fileEditJsonSchema as unknown as Record<string, unknown> },
+      maxTokens: 16000,
+    });
+    await finishGeneration(gen.id, "done", usage);
+
+    let content = data.content ?? "";
+    const fenced = content.match(/^```[a-zA-Z]*\s*\n([\s\S]*?)\n```\s*$/);
+    if (fenced) content = fenced[1];
+
+    const saved = await updateFileContent(plugin, user, fileId, content);
+
+    await db.insert(messages).values({ pluginId: plugin.id, fileId, role: "user", phase: "filechat", content: message });
+    await db.insert(messages).values({
+      pluginId: plugin.id,
+      fileId,
+      role: "coder",
+      phase: "filechat",
+      content: data.explanation || "(file aggiornato)",
+      model,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+    });
+
+    return { content, explanation: data.explanation || "", worst: saved.worst, status: saved.status };
+  } catch (err) {
+    await finishGeneration(gen.id, "failed", undefined, errorMessage(err));
+    throw err;
+  }
 }
 
 /** Recompute plugin status from how many manifest files now exist + their severity. */

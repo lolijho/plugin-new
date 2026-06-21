@@ -15,6 +15,13 @@
       "when": 1782028847604,
       "tag": "0001_previous_edwin_jarvis",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1782057257978,
+      "tag": "0002_silly_living_tribunal",
+      "breakpoints": true
     }
   ]
 }

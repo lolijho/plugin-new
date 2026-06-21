@@ -32,6 +32,7 @@ type Message = {
   phase: string | null;
   content: string;
   model: string | null;
+  fileId: string | null;
   createdAt: string;
 };
 type PluginRow = {
@@ -73,6 +74,10 @@ export default function PluginWorkspace() {
   const [editContent, setEditContent] = useState("");
   const [savingFile, setSavingFile] = useState(false);
   const [fileMsg, setFileMsg] = useState<string | null>(null);
+  // Per-file chat (Claude Opus)
+  const [chatInput, setChatInput] = useState("");
+  const [chatSending, setChatSending] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const res = await fetch(`/api/plugins/${id}`);
@@ -242,6 +247,30 @@ export default function PluginWorkspace() {
     }
   }
 
+  async function sendChat() {
+    const sf = files.find((f) => f.path === selected) ?? files[0] ?? null;
+    if (!sf || chatInput.trim().length < 2) return;
+    const msg = chatInput.trim();
+    setChatSending(true);
+    setChatError(null);
+    setChatInput("");
+    try {
+      const res = await fetch(`/api/plugins/${id}/files/${sf.id}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: msg }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Chat fallita");
+      await load();
+    } catch (err) {
+      setChatError(err instanceof Error ? err.message : "errore");
+      setChatInput(msg);
+    } finally {
+      setChatSending(false);
+    }
+  }
+
   if (error && !plugin) return <div className="card p-6 text-red-300">{error}</div>;
   if (!plugin) return <div className="text-sm text-[var(--color-muted)]">Loading…</div>;
 
@@ -250,6 +279,8 @@ export default function PluginWorkspace() {
   const critical = findings.filter((f) => f.severity === "critical").length;
   const high = findings.filter((f) => f.severity === "high").length;
   const selectedFile = files.find((f) => f.path === selected) ?? files[0] ?? null;
+  const convoMessages = messages.filter((m) => !m.fileId);
+  const fileChat = selectedFile ? messages.filter((m) => m.fileId === selectedFile.id) : [];
 
   return (
     <div className="space-y-5">
@@ -385,7 +416,7 @@ export default function PluginWorkspace() {
             {files.map((f) => (
               <li key={f.id}>
                 <button
-                  onClick={() => { setSelected(f.path); setEditing(false); setFileMsg(null); }}
+                  onClick={() => { setSelected(f.path); setEditing(false); setFileMsg(null); setChatError(null); }}
                   className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left font-mono text-xs ${
                     selectedFile?.path === f.path ? "bg-[var(--color-panel-2)]" : "hover:bg-[var(--color-panel-2)]"
                   }`}
@@ -427,9 +458,42 @@ export default function PluginWorkspace() {
                     onChange={(e) => setEditContent(e.target.value)}
                   />
                 ) : (
-                  <pre className="max-h-[64vh] overflow-auto p-4 text-xs leading-relaxed">
+                  <pre className="max-h-[52vh] overflow-auto p-4 text-xs leading-relaxed">
                     <code>{selectedFile.content}</code>
                   </pre>
+                )}
+
+                {!editing && (
+                  <div className="border-t border-[var(--color-border)]">
+                    <div className="flex items-center gap-2 px-3 pt-2 text-[10px] font-medium uppercase tracking-wide text-[var(--color-muted)]">
+                      💬 Modifica con Claude Opus
+                    </div>
+                    {fileChat.length > 0 && (
+                      <div className="max-h-44 space-y-2 overflow-auto px-3 py-2">
+                        {fileChat.map((m) => (
+                          <div key={m.id} className={m.role === "user" ? "text-right" : ""}>
+                            <span className={`inline-block max-w-[85%] whitespace-pre-wrap rounded-lg px-2.5 py-1.5 text-xs ${m.role === "user" ? "bg-[var(--color-accent)]/15" : "bg-[var(--color-panel-2)]"}`}>
+                              {m.content}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="flex gap-2 p-3">
+                      <input
+                        className="input text-sm"
+                        placeholder="es. “aggiungi un controllo nonce al form di salvataggio”"
+                        value={chatInput}
+                        onChange={(e) => setChatInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter" && !chatSending) sendChat(); }}
+                        disabled={chatSending}
+                      />
+                      <button className="btn-primary px-3 text-sm" disabled={chatSending || chatInput.trim().length < 2} onClick={sendChat}>
+                        {chatSending ? "…" : "Invia"}
+                      </button>
+                    </div>
+                    {chatError && <div className="px-3 pb-2 text-xs text-red-300">{chatError}</div>}
+                  </div>
                 )}
               </>
             ) : (
@@ -489,7 +553,7 @@ export default function PluginWorkspace() {
           <div className="card p-4">
             <h3 className="mb-2 text-sm font-semibold">Conversation</h3>
             <ul className="max-h-[60vh] space-y-3 overflow-auto">
-              {messages.map((m) => (
+              {convoMessages.map((m) => (
                 <li key={m.id}>
                   <div className="mb-0.5 flex items-center gap-2 text-xs text-[var(--color-muted)]">
                     <span className="font-semibold uppercase">{m.role}</span>
@@ -498,7 +562,7 @@ export default function PluginWorkspace() {
                   <p className="whitespace-pre-wrap text-sm">{m.content}</p>
                 </li>
               ))}
-              {messages.length === 0 && <li className="text-sm text-[var(--color-muted)]">No messages yet.</li>}
+              {convoMessages.length === 0 && <li className="text-sm text-[var(--color-muted)]">No messages yet.</li>}
             </ul>
           </div>
         </div>

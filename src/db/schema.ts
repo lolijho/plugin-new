@@ -145,8 +145,10 @@ export const messages = pgTable(
     generationId: text("generation_id").references(() => generations.id, {
       onDelete: "set null",
     }),
+    // Set for per-file chat messages (links a conversation to a single file).
+    fileId: text("file_id").references(() => pluginFiles.id, { onDelete: "set null" }),
     role: messageRole("role").notNull(),
-    phase: text("phase"), // architect | coder | reviewer | chat
+    phase: text("phase"), // architect | coder | reviewer | chat | filechat
     content: text("content").notNull(),
     model: text("model"),
     promptTokens: integer("prompt_tokens").default(0),

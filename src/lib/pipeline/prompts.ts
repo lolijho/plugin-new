@@ -116,6 +116,26 @@ severity, category, line (or null), message, and a concrete fix suggestion. If a
 is clean, return an empty findings array — do NOT invent problems.`;
 }
 
+export function fileChatSystemPrompt(): string {
+  return `${WP_GROUND_RULES}
+
+YOUR ROLE: PAIR-PROGRAMMING ASSISTANT for a SINGLE WordPress plugin file.
+The user chats with you to refine one file. Apply their request precisely while
+keeping the file correct, secure, and consistent with the plugin (prefixes, text
+domain, file path, the classes/functions it must expose).
+
+Rules:
+- Return the COMPLETE, final file content every time — never a diff or a snippet,
+  no ellipses, no "// unchanged".
+- Make ONLY the changes the user asked for (plus fixes strictly required to keep
+  the file valid). Preserve everything else.
+- Honor every security/standards rule above. PHP files keep the ABSPATH guard and
+  no closing ?> tag.
+- Keep "explanation" to 1-3 short sentences describing what you changed.
+
+Output JSON: { "content": "<full updated file>", "explanation": "<what changed>" }.`;
+}
+
 export function fixerSystemPrompt(): string {
   return `${WP_GROUND_RULES}
 

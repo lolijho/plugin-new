@@ -1,0 +1,2 @@
+ALTER TABLE "messages" ADD COLUMN "file_id" text;--> statement-breakpoint
+ALTER TABLE "messages" ADD CONSTRAINT "messages_file_id_plugin_files_id_fk" FOREIGN KEY ("file_id") REFERENCES "public"."plugin_files"("id") ON DELETE set null ON UPDATE no action;

@@ -37,3 +37,8 @@ export function autofixIterations(user: DbUser): number {
   const n = user.settings?.autofixIterations;
   return typeof n === "number" && n >= 0 && n <= 5 ? n : 2;
 }
+
+/** Model used by the per-file editing chat. Defaults to Claude Opus. */
+export function fileChatModel(): string {
+  return process.env.FILECHAT_MODEL || "anthropic/claude-opus-4.1";
+}

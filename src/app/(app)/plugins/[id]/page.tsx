@@ -434,6 +434,31 @@ export default function PluginWorkspace() {
               </li>
             )}
           </ul>
+
+          {/* Inline diagnosis: paste the WordPress error and let Opus find the cause */}
+          <div className="mt-3 border-t border-red-500/20 pt-3">
+            <div className="mb-1.5 text-xs font-semibold text-red-200">
+              🔎 Non sai qual è la causa? Incolla l&apos;errore di WordPress e fallo analizzare:
+            </div>
+            <textarea
+              className="input min-h-[52px] text-xs"
+              placeholder="(opzionale) es. “Fatal error: Uncaught Error: Call to undefined function myplugin_init() in …”"
+              value={diagInput}
+              onChange={(e) => setDiagInput(e.target.value)}
+            />
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <button className="btn-ghost px-3 py-1.5 text-xs" disabled={diagnosing || !hasFiles} onClick={diagnose}>
+                {diagnosing ? "Analisi in corso…" : "🔎 Trova l'errore con Opus"}
+              </button>
+              {diagError && <span className="text-xs text-red-300">{diagError}</span>}
+            </div>
+            {diagnosis && (
+              <div className="mt-2 whitespace-pre-wrap rounded-lg bg-[var(--color-panel-2)] p-3 text-sm text-[var(--color-text)]">
+                <div className="mb-1 text-xs font-semibold uppercase text-[var(--color-muted)]">Diagnosi</div>
+                {diagnosis}
+              </div>
+            )}
+          </div>
         </div>
       )}
 

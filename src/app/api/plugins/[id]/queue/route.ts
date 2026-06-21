@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { and, eq, inArray, asc } from "drizzle-orm";
+import { and, eq, inArray, asc, sql } from "drizzle-orm";
 import { NextResponse } from "next/server";
-import { db, plugins, jobs } from "@/db";
+import { db, plugins, jobs, generations } from "@/db";
 import { authed, badRequest, json, notFound, serverError } from "@/lib/api";
 import { startWorker } from "@/lib/pipeline/worker";
 
@@ -79,7 +79,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       .where(and(eq(jobs.pluginId, id), inArray(jobs.status, ["queued", "running", "failed"])))
       .orderBy(asc(jobs.createdAt));
 
-    return json({ paused: plugin.queuePaused, jobs: rows });
+    // Total spend for this plugin = sum of every generation's OpenRouter cost
+    // (includes the architecture step and live-updating in-progress builds).
+    const [{ cost }] = await db
+      .select({ cost: sql<number>`COALESCE(SUM(${generations.costUsd}), 0)` })
+      .from(generations)
+      .where(eq(generations.pluginId, id));
+
+    return json({ paused: plugin.queuePaused, jobs: rows, costUsd: Number(cost) });
   } catch (err) {
     return serverError(err);
   }

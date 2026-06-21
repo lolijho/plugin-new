@@ -114,6 +114,8 @@ async function runFilePipeline(args: {
   /** When provided, skip the coder and review/fix this existing content instead. */
   seed?: GeneratedFile;
   emit?: (e: RunEvent) => void;
+  /** Called after each LLM call with that call's usage (for live cost). */
+  onUsage?: (u: Usage) => void;
 }): Promise<{ file: GeneratedFile; findings: ReviewFinding[]; validations: ValidationResult[]; usage: Usage }> {
   const usage = zeroUsage();
 
@@ -130,6 +132,7 @@ async function runFilePipeline(args: {
       written: args.written,
     });
     addUsage(usage, coded.usage);
+    args.onUsage?.(coded.usage);
     file = coded.file;
     args.emit?.({ type: "file:coded", path: file.path });
   }
@@ -145,6 +148,7 @@ async function runFilePipeline(args: {
       file,
     });
     addUsage(usage, review.usage);
+    args.onUsage?.(review.usage);
     findings = review.findings;
     validations = await validateFiles([toValidation(file)], args.manifest);
     args.emit?.({ type: "file:reviewed", path: file.path, findings: findings.length, worst: worstOf(findings, validations) });
@@ -165,6 +169,7 @@ async function runFilePipeline(args: {
       validations,
     });
     addUsage(usage, fixed.usage);
+    args.onUsage?.(fixed.usage);
     file = fixed.file;
     args.emit?.({ type: "file:fixed", path: file.path, iteration: iter + 1 });
   }
@@ -259,6 +264,7 @@ export async function generatePlugin(
     .returning();
 
   const totalUsage = zeroUsage();
+  const onUsage = liveCostUpdater(gen.id);
 
   try {
     // Full regeneration: clear previous artifacts.
@@ -283,7 +289,7 @@ export async function generatePlugin(
       emit({ type: "file:start", path: spec.path, index: i + 1, total: manifest.files.length });
 
       const { file, findings, validations, usage } = await runFilePipeline({
-        manifest, spec, written, coderModel, reviewerModel, apiKey, user, maxFix, emit,
+        manifest, spec, written, coderModel, reviewerModel, apiKey, user, maxFix, emit, onUsage,
       });
       addUsage(totalUsage, usage);
 
@@ -353,6 +359,7 @@ export async function generateFile(
       user,
       maxFix: autofixIterations(user),
       emit,
+      onUsage: liveCostUpdater(gen.id),
     });
     void memories; // retrieval also warms importance / future semantic use
 
@@ -404,7 +411,7 @@ export async function analyzeFile(plugin: DbPlugin, user: DbUser, path: string, 
       manifest, spec, written: [],
       coderModel: resolveModel("coder", { user, plugin }),
       reviewerModel: resolveModel("reviewer", { user, plugin }),
-      apiKey: resolveApiKey(user), user, maxFix: 0, seed, emit,
+      apiKey: resolveApiKey(user), user, maxFix: 0, seed, emit, onUsage: liveCostUpdater(gen.id),
     });
     const res = await persistFile(plugin.id, gen.id, plugin.version, spec, file, findings, validations);
     await finishGeneration(gen.id, "done", usage);
@@ -438,7 +445,7 @@ export async function fixFile(plugin: DbPlugin, user: DbUser, path: string, emit
       reviewerModel: resolveModel("reviewer", { user, plugin }),
       apiKey: resolveApiKey(user), user,
       maxFix: Math.max(1, autofixIterations(user)),
-      seed, emit,
+      seed, emit, onUsage: liveCostUpdater(gen.id),
     });
     const res = await persistFile(plugin.id, gen.id, plugin.version, spec, file, findings, validations);
     await finishGeneration(gen.id, "done", usage);
@@ -520,6 +527,18 @@ async function finishGeneration(id: string, status: "done" | "failed", usage?: U
       costUsd: usage?.costUsd ?? 0,
     })
     .where(eq(generations.id, id));
+}
+
+/**
+ * Returns an onUsage callback that live-updates a generation's running cost
+ * after each LLM call, so the per-plugin spend counter ticks up in real time.
+ */
+function liveCostUpdater(generationId: string): (u: Usage) => void {
+  let cost = 0;
+  return (u: Usage) => {
+    cost += u.costUsd;
+    db.update(generations).set({ costUsd: cost }).where(eq(generations.id, generationId)).catch(() => {});
+  };
 }
 
 // ── Small utils ─────────────────────────────────────────────────────────────

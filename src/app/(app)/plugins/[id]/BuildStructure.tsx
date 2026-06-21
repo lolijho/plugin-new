@@ -25,6 +25,7 @@ const ACTION_SHORT: Record<Action, string> = {
   "analyze-file": "analizza",
   "fix-file": "correggi",
 };
+const fmtCost = (n: number) => (n < 1 ? `$${n.toFixed(4)}` : `$${n.toFixed(3)}`);
 
 export default function BuildStructure({
   pluginId,
@@ -41,6 +42,9 @@ export default function BuildStructure({
   const [paused, setPaused] = useState(false);
   const [display, setDisplay] = useState(0); // smoothed % for the running job
   const [error, setError] = useState<string | null>(null);
+  const [cost, setCost] = useState(0); // server total (target)
+  const [costShown, setCostShown] = useState(0); // animated value
+  const costTargetRef = useRef(0);
 
   const runningRef = useRef<{ id: string; floor: number } | null>(null);
   const prevRunningId = useRef<string | null>(null);
@@ -82,9 +86,10 @@ export default function BuildStructure({
     try {
       const res = await fetch(`/api/plugins/${pluginId}/queue`, { cache: "no-store" });
       if (!res.ok) return;
-      const data = (await res.json()) as { paused: boolean; jobs: Job[] };
+      const data = (await res.json()) as { paused: boolean; jobs: Job[]; costUsd?: number };
       setServerJobs(data.jobs);
       setPaused(data.paused);
+      setCost(data.costUsd ?? 0);
 
       const run = data.jobs.find((j) => j.status === "running") ?? null;
       // Smooth progress bookkeeping.
@@ -129,6 +134,23 @@ export default function BuildStructure({
       setDisplay((d) => (d < cap ? Math.min(d + 1, cap) : d));
     }, 700);
     return () => clearInterval(t);
+  }, []);
+
+  // Animate the spend counter up to the server total.
+  useEffect(() => {
+    costTargetRef.current = cost;
+  }, [cost]);
+  useEffect(() => {
+    let raf = 0;
+    const loop = () => {
+      setCostShown((s) => {
+        const diff = costTargetRef.current - s;
+        return Math.abs(diff) < 1e-7 ? costTargetRef.current : s + diff * 0.08;
+      });
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
   }, []);
 
   async function enqueue(items: { path: string; action: Action }[]) {
@@ -176,9 +198,15 @@ export default function BuildStructure({
             La coda gira <b>sul server</b>: puoi chiudere l’app o spegnere il computer, la creazione continua. Riapri quando vuoi per vedere l’avanzamento.
           </p>
         </div>
-        <button className="btn-ghost" disabled={pendingPaths.length === 0} onClick={() => enqueue(pendingPaths.map((p) => ({ path: p, action: "generate-file" as const })))}>
-          ＋ Coda tutti i rimanenti ({pendingPaths.length})
-        </button>
+        <div className="flex flex-col items-end gap-2">
+          <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-right">
+            <div className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-muted)]">Spesa OpenRouter</div>
+            <div className="text-lg font-bold tabular-nums text-emerald-300">{fmtCost(costShown)}</div>
+          </div>
+          <button className="btn-ghost" disabled={pendingPaths.length === 0} onClick={() => enqueue(pendingPaths.map((p) => ({ path: p, action: "generate-file" as const })))}>
+            ＋ Coda tutti i rimanenti ({pendingPaths.length})
+          </button>
+        </div>
       </div>
 
       {/* Queue panel */}

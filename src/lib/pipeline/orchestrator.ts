@@ -312,6 +312,7 @@ export async function generateFile(
   plugin: DbPlugin,
   user: DbUser,
   path: string,
+  emit?: (e: RunEvent) => void,
 ): Promise<{ file: GeneratedFile; worst: Severity | null; critical: number; high: number; status: string; createdCount: number; total: number }> {
   const parsed = pluginManifestSchema.safeParse(plugin.manifest);
   if (!parsed.success) throw new Error("No approved architecture manifest found.");
@@ -339,6 +340,7 @@ export async function generateFile(
   }
 
   try {
+    emit?.({ type: "file:start", path, index: 1, total: 1 });
     const memories = await retrieveMemory({ userId: user.id, pluginId: plugin.id, query: `${manifest.summary}\n${spec.purpose}\n${spec.path}`, limit: 6 });
 
     const { file, findings, validations, usage } = await runFilePipeline({
@@ -350,13 +352,14 @@ export async function generateFile(
       apiKey: resolveApiKey(user),
       user,
       maxFix: autofixIterations(user),
-      // memoryBlock is folded into the coder via prompts; keep single-file lean
+      emit,
     });
     void memories; // retrieval also warms importance / future semantic use
 
     const res = await persistFile(plugin.id, gen.id, plugin.version, spec, file, findings, validations);
     await finishGeneration(gen.id, "done", usage);
     await learnFromGeneration(plugin, user, gen.id, manifest);
+    emit?.({ type: "file:done", path, worst: res.worst });
 
     const completion = await recomputeStatus(plugin.id, manifest);
     return { file, worst: res.worst, critical: res.critical, high: res.high, ...completion };
@@ -392,18 +395,20 @@ async function loadForAction(plugin: DbPlugin, path: string) {
 }
 
 /** Re-review + re-validate an existing file WITHOUT changing its code. */
-export async function analyzeFile(plugin: DbPlugin, user: DbUser, path: string): Promise<FileActionResult> {
+export async function analyzeFile(plugin: DbPlugin, user: DbUser, path: string, emit?: (e: RunEvent) => void): Promise<FileActionResult> {
   const { manifest, spec, seed } = await loadForAction(plugin, path);
   const [gen] = await db.insert(generations).values({ pluginId: plugin.id, phase: "reviewing", status: "running" }).returning();
   try {
+    emit?.({ type: "file:start", path, index: 1, total: 1 });
     const { file, findings, validations, usage } = await runFilePipeline({
       manifest, spec, written: [],
       coderModel: resolveModel("coder", { user, plugin }),
       reviewerModel: resolveModel("reviewer", { user, plugin }),
-      apiKey: resolveApiKey(user), user, maxFix: 0, seed,
+      apiKey: resolveApiKey(user), user, maxFix: 0, seed, emit,
     });
     const res = await persistFile(plugin.id, gen.id, plugin.version, spec, file, findings, validations);
     await finishGeneration(gen.id, "done", usage);
+    emit?.({ type: "file:done", path, worst: res.worst });
     const completion = await recomputeStatus(plugin.id, manifest);
     return { worst: res.worst, critical: res.critical, high: res.high, ...completion };
   } catch (err) {
@@ -413,7 +418,7 @@ export async function analyzeFile(plugin: DbPlugin, user: DbUser, path: string):
 }
 
 /** Re-review an existing file and let the coder rewrite it to clear the issues. */
-export async function fixFile(plugin: DbPlugin, user: DbUser, path: string): Promise<FileActionResult> {
+export async function fixFile(plugin: DbPlugin, user: DbUser, path: string, emit?: (e: RunEvent) => void): Promise<FileActionResult> {
   const { manifest, spec, seed } = await loadForAction(plugin, path);
   // Other existing files give the fixer cross-file context.
   const others = await db
@@ -426,17 +431,19 @@ export async function fixFile(plugin: DbPlugin, user: DbUser, path: string): Pro
 
   const [gen] = await db.insert(generations).values({ pluginId: plugin.id, phase: "generating", status: "running" }).returning();
   try {
+    emit?.({ type: "file:start", path, index: 1, total: 1 });
     const { file, findings, validations, usage } = await runFilePipeline({
       manifest, spec, written,
       coderModel: resolveModel("coder", { user, plugin }),
       reviewerModel: resolveModel("reviewer", { user, plugin }),
       apiKey: resolveApiKey(user), user,
       maxFix: Math.max(1, autofixIterations(user)),
-      seed,
+      seed, emit,
     });
     const res = await persistFile(plugin.id, gen.id, plugin.version, spec, file, findings, validations);
     await finishGeneration(gen.id, "done", usage);
     await learnFromGeneration(plugin, user, gen.id, manifest);
+    emit?.({ type: "file:done", path, worst: res.worst });
     const completion = await recomputeStatus(plugin.id, manifest);
     return { worst: res.worst, critical: res.critical, high: res.high, ...completion };
   } catch (err) {

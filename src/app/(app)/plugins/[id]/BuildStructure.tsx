@@ -38,7 +38,25 @@ export default function BuildStructure({
   const pausedRef = useRef(false);
   const [paused, setPaused] = useState(false);
   const [current, setCurrent] = useState<QueueItem | null>(null);
+  const [progress, setProgress] = useState<{ percent: number; label: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Smoothly creep the bar between real phase milestones so it always moves.
+  const creepTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const creepCapRef = useRef(20);
+  const startCreep = () => {
+    stopCreep();
+    creepCapRef.current = 18;
+    creepTimer.current = setInterval(() => {
+      setProgress((p) => (p && p.percent < creepCapRef.current ? { ...p, percent: Math.min(p.percent + 1, creepCapRef.current) } : p));
+    }, 600);
+  };
+  const stopCreep = () => {
+    if (creepTimer.current) {
+      clearInterval(creepTimer.current);
+      creepTimer.current = null;
+    }
+  };
 
   const sync = () => setQueue([...queueRef.current]);
 
@@ -70,15 +88,41 @@ export default function BuildStructure({
   const createdCount = manifest.files.filter((f) => createdMap.has(f.path)).length;
   const pendingPaths = manifest.files.filter((f) => !createdMap.has(f.path)).map((f) => f.path);
 
-  async function callAction(item: QueueItem): Promise<boolean> {
+  // Runs one action, streaming pipeline phases → percentage via SSE.
+  async function streamAction(item: QueueItem, onProgress: (percent: number, label: string) => void): Promise<void> {
     const res = await fetch(`/api/plugins/${pluginId}/${item.action}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: item.path }),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error ?? "Operazione fallita");
-    return true;
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error ?? "Operazione fallita");
+    }
+    if (!res.body) throw new Error("Nessuno stream");
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop() ?? "";
+      for (const part of parts) {
+        const line = part.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        let evt: { type: string; percent?: number; label?: string; message?: string };
+        try {
+          evt = JSON.parse(line.slice(5).trim());
+        } catch {
+          continue;
+        }
+        if (evt.type === "progress") onProgress(evt.percent ?? 0, evt.label ?? "");
+        else if (evt.type === "error") throw new Error(evt.message ?? "Errore");
+        else if (evt.type === "result") onProgress(100, "Completato");
+      }
+    }
   }
 
   async function runWorker() {
@@ -89,15 +133,24 @@ export default function BuildStructure({
       while (!pausedRef.current && queueRef.current.length > 0) {
         const item = queueRef.current[0];
         setCurrent(item);
+        setProgress({ percent: 4, label: `${ACTION_SHORT[item.action]}…` });
+        startCreep();
         try {
-          await callAction(item);
+          await streamAction(item, (percent, label) => {
+            creepCapRef.current = Math.min(percent + 14, 96);
+            setProgress((p) => ({ percent: Math.max(p?.percent ?? 0, percent), label: label || p?.label || "" }));
+          });
+          stopCreep();
           queueRef.current.shift();
           sync();
           setCurrent(null);
+          setProgress(null);
           await onChanged();
         } catch (err) {
           // Pause the queue on error so the user can intervene; keep the item.
+          stopCreep();
           setCurrent(null);
+          setProgress(null);
           setError(`${item.path} (${ACTION_SHORT[item.action]}): ${err instanceof Error ? err.message : "errore"}`);
           pausedRef.current = true;
           setPaused(true);
@@ -105,6 +158,7 @@ export default function BuildStructure({
         }
       }
     } finally {
+      stopCreep();
       processingRef.current = false;
     }
   }
@@ -180,10 +234,16 @@ export default function BuildStructure({
         </div>
 
         {current && (
-          <div className="mb-2 flex items-center gap-2 rounded-lg bg-[var(--color-panel-2)] px-3 py-2 text-sm">
-            <span className="animate-pulse">⏳</span>
-            <span className="font-mono text-xs">{current.path}</span>
-            <span className="text-xs text-[var(--color-accent)]">{ACTION_SHORT[current.action]}…</span>
+          <div className="mb-2 rounded-lg bg-[var(--color-panel-2)] px-3 py-2">
+            <div className="mb-1.5 flex items-center gap-2 text-sm">
+              <span className="animate-pulse">⏳</span>
+              <span className="font-mono text-xs">{current.path}</span>
+              <span className="text-xs text-[var(--color-accent)]">{progress?.label ?? `${ACTION_SHORT[current.action]}…`}</span>
+              <span className="ml-auto text-sm font-semibold tabular-nums">{progress?.percent ?? 0}%</span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded bg-[var(--color-bg)]">
+              <div className="h-full rounded bg-[var(--color-accent)] transition-all duration-500" style={{ width: `${progress?.percent ?? 0}%` }} />
+            </div>
           </div>
         )}
 
@@ -250,7 +310,9 @@ export default function BuildStructure({
                       <p className="truncate text-xs text-[var(--color-muted)]">{f.purpose}</p>
                     </div>
                     <div className="flex shrink-0 items-center gap-1.5">
-                      {!created ? (
+                      {isCurrent ? (
+                        <span className="text-xs font-semibold tabular-nums text-[var(--color-accent)]">{progress?.percent ?? 0}%</span>
+                      ) : !created ? (
                         <button className="btn-ghost px-2.5 py-1 text-xs" disabled={isQueued("generate-file")} onClick={() => enqueue([{ path: f.path, action: "generate-file" }])}>
                           {isQueued("generate-file") ? "in coda" : "Crea"}
                         </button>

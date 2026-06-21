@@ -2,8 +2,9 @@ import { z } from "zod";
 import { and, eq } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { db, plugins } from "@/db";
-import { authed, badRequest, json, notFound, serverError } from "@/lib/api";
+import { authed, badRequest, notFound, serverError } from "@/lib/api";
 import { analyzeFile } from "@/lib/pipeline/orchestrator";
+import { streamFileAction } from "@/lib/pipeline/file-stream";
 
 export const maxDuration = 300;
 export const dynamic = "force-dynamic";
@@ -26,8 +27,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const body = schema.safeParse(await req.json());
     if (!body.success) return badRequest("A file path is required.");
 
-    const result = await analyzeFile(plugin, user, body.data.path);
-    return json(result);
+    return streamFileAction((emit) => analyzeFile(plugin, user, body.data.path, emit));
   } catch (err) {
     return serverError(err);
   }

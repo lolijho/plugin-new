@@ -315,6 +315,28 @@ export default function PluginWorkspace() {
     }
   }
 
+  // Tool: queue a fixer pass for every file that has a critical (or high) finding.
+  async function fixCritical(severities: string[]) {
+    const paths = [...new Set(findings.filter((f) => severities.includes(f.severity)).map((f) => f.filePath).filter(Boolean))];
+    if (paths.length === 0) return;
+    setError(null);
+    try {
+      const res = await fetch(`/api/plugins/${id}/queue`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: paths.map((p) => ({ path: p, action: "fix-file" })) }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error ?? "Errore nell'accodamento");
+      }
+      setTab("structure");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "errore");
+    }
+  }
+
   if (error && !plugin) return <div className="card p-6 text-red-300">{error}</div>;
   if (!plugin) return <div className="text-sm text-[var(--color-muted)]">Loading…</div>;
 
@@ -322,6 +344,7 @@ export default function PluginWorkspace() {
   const builtCount = manifest ? manifest.files.filter((mf) => files.some((f) => f.path === mf.path)).length : 0;
   const critical = findings.filter((f) => f.severity === "critical").length;
   const high = findings.filter((f) => f.severity === "high").length;
+  const criticalFiles = [...new Set(findings.filter((f) => f.severity === "critical").map((f) => f.filePath).filter(Boolean))];
   const selectedFile = files.find((f) => f.path === selected) ?? files[0] ?? null;
   const convoMessages = messages.filter((m) => !m.fileId);
   const fileChat = selectedFile ? messages.filter((m) => m.fileId === selectedFile.id) : [];
@@ -350,6 +373,18 @@ export default function PluginWorkspace() {
       </div>
 
       {error && <div className="rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">{error}</div>}
+
+      {/* Critical-error fix tool */}
+      {criticalFiles.length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3">
+          <div className="text-sm text-red-200">
+            ⚠ Questo plugin ha <b>errori critici</b> in {criticalFiles.length} file. Lo strumento li mette in coda e fa riscrivere i file dal correttore (Claude) finché i critici sono risolti.
+          </div>
+          <button className="btn-primary shrink-0" onClick={() => fixCritical(["critical", "high"])}>
+            🛠️ Risolvi errori critici ({criticalFiles.length})
+          </button>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 border-b border-[var(--color-border)]">
@@ -576,10 +611,17 @@ export default function PluginWorkspace() {
             </div>
           ) : (
             <>
-              <div className="flex gap-2 text-sm">
-                <span className="badge sev-critical">{critical} critical</span>
-                <span className="badge sev-high">{high} high</span>
-                <span className="text-[var(--color-muted)]">· {findings.length} total</span>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex gap-2 text-sm">
+                  <span className="badge sev-critical">{critical} critical</span>
+                  <span className="badge sev-high">{high} high</span>
+                  <span className="text-[var(--color-muted)]">· {findings.length} total</span>
+                </div>
+                {criticalFiles.length > 0 && (
+                  <button className="btn-primary px-3 py-1.5 text-xs" onClick={() => fixCritical(["critical", "high"])}>
+                    🛠️ Risolvi errori critici ({criticalFiles.length} file)
+                  </button>
+                )}
               </div>
               <ul className="space-y-2">
                 {findings.map((f) => (
